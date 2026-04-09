@@ -2,7 +2,7 @@
 
 TypeScript SDK for building, reading, and validating Bitcoin SV transactions.
 
-DSTAS is the SDK for the official STAS 3.0 version ([STAS 3.0 script templates](https://github.com/stassso/STAS-3-script-templates)).
+This SDK implements the official STAS 3.0 version through its DSTAS surface ([STAS 3.0 script templates](https://github.com/stassso/STAS-3-script-templates)).
 
 The public surface is split into three entrypoints:
 

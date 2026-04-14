@@ -1,6 +1,6 @@
 {
   "name": "dxs-bsv-token-sdk",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "TypeScript SDK for Bitcoin SV with first-class DSTAS flows, older STAS helpers, and low-level BSV primitives for transaction and script work.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

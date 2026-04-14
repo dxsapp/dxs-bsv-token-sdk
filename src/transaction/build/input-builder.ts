@@ -42,6 +42,7 @@ export class InputBilder {
 
   private _mergeVout: number = 0;
   private _mergeSegments: Bytes[] = [];
+  private _swapCounterpartyScript: Bytes | null = null;
 
   constructor(
     txBuilder: TransactionBuilder,
@@ -152,10 +153,16 @@ export class InputBilder {
         .addData(reverseBytes(fromHex(fundingInput.OutPoint.TxId)));
 
       if (this.Merge) {
-        script
-          .addNumber(this._mergeVout)
-          .addDatas(this._mergeSegments)
-          .addNumber(this._mergeSegments.length);
+        script.addNumber(this._mergeVout).addDatas(this._mergeSegments);
+
+        if (this._swapCounterpartyScript) {
+          script
+            .addNumber(this._mergeSegments.length)
+            .addData(this._swapCounterpartyScript)
+            .addNumber(1);
+        } else {
+          script.addNumber(this._mergeSegments.length);
+        }
       } else {
         script.addOpCode(OpCode.OP_0);
       }
@@ -388,6 +395,10 @@ export class InputBilder {
         size += getNumberSize(this._mergeVout);
         size += getNumberSize(this._mergeSegments.length);
         size += this._mergeSegments.reduce((a, x) => getChunkSize(x) + a, 0);
+        if (this._swapCounterpartyScript) {
+          size += estimateChunkSize(this._swapCounterpartyScript.length);
+          size += getNumberSize(1);
+        }
       }
 
       if (this.OutPoint.ScriptType === ScriptType.dstas) {
@@ -523,21 +534,23 @@ export class InputBilder {
 
     this._mergeVout = mergeUtxo.OutPoint.Vout;
     if (this.OutPoint.ScriptType === ScriptType.dstas) {
-      const lockingScript = this.TxBuilder.Inputs[0].OutPoint.LockingScript;
-      const shouldUseWholeCounterpartyTx =
+      const isSwap =
         this.hasDstasSwapActionData(this.OutPoint.LockingScript) ||
         this.hasDstasSwapActionData(mergeUtxo.OutPoint.LockingScript);
 
-      if (shouldUseWholeCounterpartyTx) {
-        this._mergeSegments = [mergeRaw];
-        return;
-      }
+      const scriptSource = isSwap
+        ? mergeUtxo.OutPoint.LockingScript
+        : this.TxBuilder.Inputs[0].OutPoint.LockingScript;
 
-      const scriptToCut = extractDstasCounterpartyScript(lockingScript);
+      const scriptToCut = extractDstasCounterpartyScript(scriptSource);
       this._mergeSegments = splitDstasPreviousTransactionByCounterpartyScript(
         mergeRaw,
         scriptToCut,
       ).reverse();
+
+      if (isSwap) {
+        this._swapCounterpartyScript = scriptToCut;
+      }
       return;
     }
 

@@ -10,7 +10,6 @@ type RawChunk = {
 
 type SwapSection = {
   start: number;
-  counterpartyOutpointIndex: number;
   counterpartyPiecesCount: number;
   counterpartyPiecesHexes: string[];
   counterpartyScriptHex: string;
@@ -27,7 +26,6 @@ export type DstasUnlockingScriptDecomposition = {
   fundingVout?: number;
   fundingTxIdLeHex?: string;
   mergeMode: "none" | "present" | "unknown";
-  counterpartyOutpointIndex?: number;
   counterpartyPiecesCount?: number;
   counterpartyPiecesHexes: string[];
   counterpartyScriptHex?: string;
@@ -114,7 +112,7 @@ const parseNumberChunk = (chunk: RawChunk): number | undefined => {
 };
 
 const tryParseSwapSection = (chunks: RawChunk[]): SwapSection | undefined => {
-  if (chunks.length < 4) return undefined;
+  if (chunks.length < 3) return undefined;
 
   const scriptChunk = chunks[chunks.length - 1];
   if (!scriptChunk.data || scriptChunk.data.length === 0) return undefined;
@@ -124,19 +122,14 @@ const tryParseSwapSection = (chunks: RawChunk[]): SwapSection | undefined => {
   if (piecesCount === undefined || piecesCount < 0) return undefined;
 
   const piecesStart = chunks.length - 2 - piecesCount;
-  if (piecesStart < 1) return undefined;
-
-  const outpointIndexChunk = chunks[piecesStart - 1];
-  const outpointIndex = parseNumberChunk(outpointIndexChunk);
-  if (outpointIndex === undefined) return undefined;
+  if (piecesStart < 0) return undefined;
 
   const pieces = chunks.slice(piecesStart, chunks.length - 2);
   if (pieces.length !== piecesCount) return undefined;
   if (pieces.some((piece) => !piece.data)) return undefined;
 
   return {
-    start: piecesStart - 1,
-    counterpartyOutpointIndex: outpointIndex,
+    start: piecesStart,
     counterpartyPiecesCount: piecesCount,
     counterpartyPiecesHexes: pieces.map((piece) => toHex(piece.data!)),
     counterpartyScriptHex: toHex(scriptChunk.data),
@@ -209,7 +202,6 @@ export const decomposeDstasUnlockingScript = (
     if (result.spendingType !== undefined && result.spendingType !== 1) {
       result.errors.push("swap section requires spending type 1");
     }
-    result.counterpartyOutpointIndex = swapSection.counterpartyOutpointIndex;
     result.counterpartyPiecesCount = swapSection.counterpartyPiecesCount;
     result.counterpartyPiecesHexes = swapSection.counterpartyPiecesHexes;
     result.counterpartyScriptHex = swapSection.counterpartyScriptHex;

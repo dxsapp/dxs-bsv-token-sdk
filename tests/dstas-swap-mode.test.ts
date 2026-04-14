@@ -8,10 +8,7 @@ import {
 } from "../src/script/build/dstas-locking-builder";
 import {
   buildDstasLockingScriptForOwnerField,
-  buildUnlockingScript,
-  buildDstasSwapUnlockingScriptFromTransaction,
   decomposeDstasUnlockingScript,
-  estimateDstasSwapUnlockingScriptSizeFromTransaction,
   extractDstasCounterpartyScript,
   splitDstasPreviousTransactionByCounterpartyScript,
 } from "../src/script";
@@ -19,6 +16,18 @@ import { buildSwapActionData } from "../src/script/dstas-action-data";
 import { ResolveDstasSwapMode } from "../src/dstas-factory";
 import { OpCode } from "../src/bitcoin/op-codes";
 import { concat, fromHex, toHex } from "../src/bytes";
+
+type ScriptChunk = { op: OpCode } | { data: Uint8Array } | { number: number };
+
+const buildUnlockingScript = (chunks: ScriptChunk[]): Uint8Array => {
+  const builder = new ScriptBuilder(ScriptType.unknown);
+  for (const chunk of chunks) {
+    if ("op" in chunk) builder.addOpCode(chunk.op);
+    else if ("number" in chunk) builder.addNumber(chunk.number);
+    else builder.addData(chunk.data);
+  }
+  return builder.toBytes();
+};
 
 const mnemonic =
   "group spy extend supreme monkey judge avocado cancel exit educate modify bubble";
@@ -51,7 +60,6 @@ const makeDstasOutPoint = (
 };
 
 const buildSyntheticSwapUnlockingScript = ({
-  counterpartyOutpointIndex,
   counterpartyPieces,
   counterpartyScript,
   piecesCount = counterpartyPieces.length,
@@ -60,7 +68,6 @@ const buildSyntheticSwapUnlockingScript = ({
   publicKey = new Uint8Array(33).fill(0x02),
   spendingType = 1,
 }: {
-  counterpartyOutpointIndex: number;
   counterpartyPieces: Uint8Array[];
   counterpartyScript: Uint8Array;
   piecesCount?: number;
@@ -70,7 +77,6 @@ const buildSyntheticSwapUnlockingScript = ({
   spendingType?: number;
 }): Uint8Array =>
   buildUnlockingScript([
-    { number: counterpartyOutpointIndex },
     ...counterpartyPieces.map((piece) => ({ data: piece })),
     { number: piecesCount },
     { data: counterpartyScript },
@@ -155,7 +161,6 @@ describe("ResolveDstasSwapMode", () => {
     const script = concat([
       buildSwapUnlockingPrefix(),
       buildSyntheticSwapUnlockingScript({
-        counterpartyOutpointIndex: 7,
         counterpartyPieces: [fromHex("aa"), fromHex("bb")],
         counterpartyScript: fromHex("cc".repeat(8)),
       }),
@@ -165,75 +170,9 @@ describe("ResolveDstasSwapMode", () => {
 
     expect(decoded.parsed).toBe(true);
     expect(decoded.spendingType).toBe(1);
-    expect(decoded.counterpartyOutpointIndex).toBe(7);
     expect(decoded.counterpartyPiecesCount).toBe(2);
     expect(decoded.counterpartyPiecesHexes).toEqual(["aa", "bb"]);
     expect(decoded.counterpartyScriptHex).toBe("cccccccccccccccc");
-  });
-
-  test("builds new swap unlocking script from derived script pieces", () => {
-    const owner =
-      Wallet.fromMnemonic(mnemonic).deriveWallet("m/44'/236'/0'/0/0");
-    const counterpartyLockingScript = buildDstasLockingScriptForOwnerField({
-      ownerField: owner.Address.Hash160,
-      tokenIdHex: toHex(tokenId),
-      freezable: true,
-      confiscatable: true,
-      authorityServiceField: new Uint8Array(20).fill(0x11),
-      confiscationAuthorityServiceField: new Uint8Array(20).fill(0x22),
-      frozen: false,
-    });
-    const counterpartyScript = extractDstasCounterpartyScript(
-      counterpartyLockingScript,
-    );
-    const previousTransaction = concat([
-      fromHex("aa"),
-      counterpartyScript,
-      fromHex("bb"),
-    ]);
-    const preimage = new Uint8Array(120).fill(0x11);
-    const signature = new Uint8Array(72).fill(0x30);
-    const publicKey = new Uint8Array(33).fill(0x02);
-
-    const unlocking = buildDstasSwapUnlockingScriptFromTransaction({
-      counterpartyOutpointIndex: 7,
-      counterpartyLockingScript,
-      counterpartyPreviousTransaction: previousTransaction,
-      preimage,
-      signature,
-      publicKey,
-      spendingType: 1,
-    });
-
-    const unlockingPrefix = buildUnlockingScript([
-      { number: 100 },
-      { data: fromHex("11".repeat(20)) },
-      { op: OpCode.OP_0 },
-      { op: OpCode.OP_0 },
-      { op: OpCode.OP_0 },
-      { number: 1 },
-      { data: fromHex("44".repeat(32)) },
-      { op: OpCode.OP_0 },
-    ]);
-    const fullUnlocking = concat([unlockingPrefix, unlocking]);
-    const decoded = decomposeDstasUnlockingScript(fullUnlocking);
-    const estimated = estimateDstasSwapUnlockingScriptSizeFromTransaction({
-      counterpartyOutpointIndex: 7,
-      counterpartyLockingScript,
-      counterpartyPreviousTransaction: previousTransaction,
-      preimageLength: preimage.length,
-      signatureLength: signature.length,
-      publicKeyLength: publicKey.length,
-      spendingType: 1,
-    });
-
-    expect(decoded.parsed).toBe(true);
-    expect(decoded.spendingType).toBe(1);
-    expect(decoded.counterpartyOutpointIndex).toBe(7);
-    expect(decoded.counterpartyPiecesCount).toBe(2);
-    expect(decoded.counterpartyPiecesHexes).toEqual(["aa", "bb"]);
-    expect(decoded.counterpartyScriptHex).toBe(toHex(counterpartyScript));
-    expect(estimated).toBe(unlocking.length);
   });
 
   test("rejects swap unlock when piecesCount overstates the available pieces", () => {
@@ -241,7 +180,6 @@ describe("ResolveDstasSwapMode", () => {
       concat([
         buildSwapUnlockingPrefix(),
         buildSyntheticSwapUnlockingScript({
-          counterpartyOutpointIndex: 7,
           counterpartyPieces: [fromHex("aa"), fromHex("bb")],
           piecesCount: 3,
           counterpartyScript: fromHex("cc".repeat(8)),
@@ -258,7 +196,6 @@ describe("ResolveDstasSwapMode", () => {
       concat([
         buildSwapUnlockingPrefix(),
         buildSyntheticSwapUnlockingScript({
-          counterpartyOutpointIndex: 7,
           counterpartyPieces: [fromHex("aa")],
           piecesCount: 2,
           counterpartyScript: fromHex("cc".repeat(8)),
@@ -305,7 +242,6 @@ describe("ResolveDstasSwapMode", () => {
       concat([
         buildSwapUnlockingPrefix(),
         buildSyntheticSwapUnlockingScript({
-          counterpartyOutpointIndex: 7,
           counterpartyPieces: splitDstasPreviousTransactionByCounterpartyScript(
             sourcePreviousTransaction,
             correctCounterpartyScript,
@@ -346,7 +282,6 @@ describe("ResolveDstasSwapMode", () => {
       concat([
         buildSwapUnlockingPrefix(),
         buildSyntheticSwapUnlockingScript({
-          counterpartyOutpointIndex: 7,
           counterpartyPieces: reorderedPieces,
           counterpartyScript,
         }),
@@ -362,23 +297,5 @@ describe("ResolveDstasSwapMode", () => {
         reconstructCounterpartyTransaction(reorderedPieces, counterpartyScript),
       ),
     ).not.toBe(toHex(sourcePreviousTransaction));
-  });
-
-  test("wrong counterparty outpoint index is surfaced as a mismatch", () => {
-    const counterpartyScript = fromHex("cc".repeat(8));
-    const decoded = decomposeDstasUnlockingScript(
-      concat([
-        buildSwapUnlockingPrefix(),
-        buildSyntheticSwapUnlockingScript({
-          counterpartyOutpointIndex: 42,
-          counterpartyPieces: [fromHex("11"), fromHex("22"), fromHex("33")],
-          counterpartyScript,
-        }),
-      ]),
-    );
-
-    expect(decoded.parsed).toBe(true);
-    expect(decoded.counterpartyOutpointIndex).toBe(42);
-    expect(decoded.counterpartyOutpointIndex).not.toBe(7);
   });
 });

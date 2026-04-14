@@ -3,7 +3,6 @@ export * from "./build/p2pkh-builder";
 export * from "./build/p2mpkh-builder";
 export * from "./build/p2stas-builder";
 export * from "./build/asm-template-builder";
-export * from "./build/unlocking-script-builder";
 export * from "./build/dstas-locking-builder";
 export * from "./build/script-builder";
 
@@ -21,6 +20,5 @@ export * from "./script-utils";
 export * from "./dstas-action-data";
 export * from "./dstas-swap-script";
 export * from "./dstas-requested-script-hash";
-export * from "./build/unlocking-script-builder";
 export * from "./templates/dstas-locking-template";
 export * from "./eval/script-evaluator";

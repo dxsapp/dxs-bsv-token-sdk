@@ -2,13 +2,20 @@
 
 **Status:** Draft / architectural. Not yet implemented. Supersedes DSTAS 1.0.4 as a fresh protocol (no migration bridge).
 
-**Document scope:** state machine, template catalog, locking script layout, tail/whitelist commitment scheme, spend paths, unlocking script formats, merge (2/4/8) mechanics, swap mechanics. Concrete pseudo-ASM per template is delivered in per-template addenda (out of scope for this doc).
+**Document scope:** state machine, template catalog, locking script layout, tail/whitelist commitment scheme, spend paths, unlocking script formats, merge (K ∈ [2, 4]) mechanics, swap mechanics. Concrete pseudo-ASM per template is delivered in per-template addenda (out of scope for this doc).
+
+**Architecture:** Option A — 4 deployable templates (`NormalBase`, `NormalSwapOnRamp`, `Frozen`, `SwapReady`) + `Contract`. Locked in after Phase 0 PIVOT + alternatives research. See `BNTP_CRITICAL_REVIEW.md` §8 Revision history for decision log.
 
 **Related documents:**
 
 - `BNTP_CRITICAL_REVIEW.md` — living design review (risks, open gaps, gates)
 - `BNTP_VS_DSTAS_COMPARISON.md` — scenario/size comparison
-- `BNTP_TEMPLATE_NORMAL.md` — Normal pseudo-ASM (to be written, supports merge 2..4)
+- `BNTP_ALTERNATIVES_EVALUATION.md` / `BNTP_ALTERNATIVES_RECOMMENDATION.md` — Option A justification
+- `BNTP_TEMPLATE_NORMAL_ASM.md` — Phase 0 exploratory pseudo-ASM of all-paths Normal (~4640b, led to Option A pivot)
+- `BNTP_WHITELIST_COMMITMENT_PROOF.md` — commitment soundness argument
+- `BNTP_ANCHOR_FOLLOWER_ALGORITHM.md` — merge-K position-determination algorithm
+- `BNTP_TEMPLATE_NORMALBASE_ASM.md` — NormalBase pseudo-ASM (Phase 0.1 deliverable, target ≤ 3000b)
+- `BNTP_TEMPLATE_NORMAL_SWAP_ONRAMP_ASM.md` — NormalSwapOnRamp pseudo-ASM (Phase 0.2, pending)
 - `BNTP_TEMPLATE_FROZEN.md` — Frozen pseudo-ASM (to be written)
 - `BNTP_TEMPLATE_SWAPREADY.md` — SwapReady pseudo-ASM (to be written)
 - `BNTP_TEMPLATE_CONTRACT.md` — Contract pseudo-ASM (to be written)
@@ -20,13 +27,14 @@
 ## 1. Design goals
 
 1. **Replace the monolithic DSTAS template** with a small family of specialized templates, one per UTXO state.
-2. **Close the state space** — any valid BNTP UTXO can only be spent to produce outputs whose locking scripts are one of the series' 5 known templates (or P2PKH for redeem/change).
+2. **Close the state space** — any valid BNTP UTXO can only be spent to produce outputs whose locking scripts are one of the series' 4 known templates (or P2PKH for redeem/change).
 3. **No recursive action_data** — action_data is either `OP_0` (Normal/Frozen discriminator) or a single swap descriptor (SwapReady), never a chain.
-4. **Reduce per-UTXO bytes** for the most common case (Normal) by ≥20% vs DSTAS 1.0.4.
-5. **Support wider merge** (up to 4-input) via single Normal template supporting variable K ∈ [2, 4].
+4. **Reduce per-UTXO bytes** for the common case (NormalBase) by ~20% vs DSTAS 1.0.4.
+5. **Support wider merge** (up to 4-input) via NormalBase template supporting variable K ∈ [2, 4].
 6. **Explicit `seriesId`** as a cryptographic commitment to the whitelist of allowed templates.
 7. **Uniform tail layout** across all templates of a series, so output verification can use a single extraction path.
-8. **DEX-compatibility** через issuer attestation gate: prepare-swap требует issuer signature, позволяя off-chain back-to-genesis validation с royalty-based business model.
+8. **DEX-compatibility** via issuer attestation gate: prepare-swap path lives in dedicated `NormalSwapOnRamp` template and requires issuer signature (via null-data output + SIGHASH_ALL covenant — see §9.4), enabling off-chain back-to-genesis validation with royalty-based business model.
+9. **Path isolation via template split** — prepare-swap is the highest-complexity path and is moved out of NormalBase to keep NormalBase body within budget. NormalSwapOnRamp is entered ONLY from NormalBase via prepare-swap-transition path.
 
 ### Non-goals (v1)
 
@@ -37,47 +45,63 @@
 
 ## 2. Glossary
 
-| Term                   | Meaning                                                                                                                                   |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| **Series**             | A closed family of 3 templates sharing one `seriesId`. Deployed together.                                                                 |
-| **Template**           | A parameterized locking script with constant body and variable fields (owner, action_data, tail).                                         |
-| **State**              | The template a UTXO is in: Normal, Frozen, SwapReady.                                                                                     |
-| **seriesId**           | 32-byte commitment to the whitelist of body hashes: `SHA256(h_Normal ‖ h_Frozen ‖ h_SwapReady)`.                                          |
-| **tokenId**            | 32-byte unique identifier for a single token issuance within a series: `SHA256(genesisTxId ‖ contractVout ‖ issuerPkh)`.                  |
-| **Whitelist block**    | 96-byte sequence `h_Normal ‖ h_Frozen ‖ h_SwapReady` embedded as constants in every template body.                                        |
-| **Body**               | Opcode sequence between `OP_2DROP` and `OP_RETURN`, split into PREFIX ‖ WHITELIST ‖ SUFFIX.                                               |
-| **h_X**                | `SHA256(PREFIX_X ‖ SUFFIX_X)` — shape hash of template X, whitelist NOT included (breaks self-reference).                                 |
-| **Tail**               | Fixed-layout field block after `OP_RETURN`: seriesId, tokenId, redemptionPkh, issuerPkh, authority block, optionalData.                   |
-| **Anchor / Follower**  | In merge-K (K ∈ [2, 4]), input[0] is anchor (reconstructs all other STAS inputs); inputs[1..K-1] are followers (reconstruct only anchor). |
-| **Issuer attestation** | Signature from `issuerPkh` over `(tokenId ‖ outpoint ‖ timestamp)` required on prepare-swap path. Off-chain B2G gate.                     |
+| Term                   | Meaning                                                                                                                                                                                                                    |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Series**             | A closed family of 4 templates sharing one `seriesId`. Deployed together.                                                                                                                                                  |
+| **Template**           | A parameterized locking script with constant body and variable fields (owner, action_data, tail).                                                                                                                          |
+| **State**              | The template a UTXO is in: NormalBase, NormalSwapOnRamp, Frozen, SwapReady.                                                                                                                                                |
+| **seriesId**           | 32-byte commitment to the whitelist of body hashes: `SHA256(h_NB ‖ h_NSO ‖ h_F ‖ h_SR)`.                                                                                                                                   |
+| **tokenId**            | 32-byte unique identifier for a single token issuance within a series: `SHA256(genesisTxId ‖ contractVout ‖ issuerPkh)`.                                                                                                   |
+| **Whitelist block**    | 128-byte sequence `h_NB ‖ h_NSO ‖ h_F ‖ h_SR` embedded as constants in every template body, at a fixed offset from body start (immediately after PREFIX).                                                                  |
+| **Body**               | Opcode sequence between `OP_2DROP` and `OP_RETURN`, split into PREFIX ‖ WHITELIST ‖ SUFFIX.                                                                                                                                |
+| **h_X**                | `SHA256(PREFIX_X ‖ SUFFIX_X)` — shape hash of template X. The WHITELIST bytes are NOT part of the hash input (self-reference avoidance — see `BNTP_WHITELIST_COMMITMENT_PROOF.md` §2-3).                                   |
+| **Tail**               | Fixed-layout 145-byte field block after `OP_RETURN`: seriesId, tokenId, redemptionPkh, issuerPkh, authority block, optionalData.                                                                                           |
+| **Anchor / Follower**  | In merge-K (K ∈ [2, 4], NormalBase only), input[0] is anchor (reconstructs all other STAS inputs); inputs[1..K-1] are followers (reconstruct only anchor). See `BNTP_ANCHOR_FOLLOWER_ALGORITHM.md` for detailed algorithm. |
+| **Issuer attestation** | Null-data output at known index in the prepare-swap tx carrying `(tokenId ‖ thisOutpoint ‖ timestamp ‖ issuerPubkey)`, bound by issuer's SIGHASH_ALL signature over the tx preimage. Off-chain B2G gate. See §9.4.         |
+| **NormalBase**         | Normal-variant template holding paths 1 (transfer/split), 2 (merge-K), 4 (freeze), 5 (confiscate), 6 (redeem), and 7 (prepare-swap-transition → NormalSwapOnRamp). Target body ≤ 3000b.                                    |
+| **NormalSwapOnRamp**   | Dedicated template for path 3 (owner-initiated swap preparation with issuer attestation). Entered via NormalBase path 7. Target body ≤ 1500b.                                                                              |
 
 ---
 
 ## 3. Template catalog
 
-Series v1 contains **3 deployable templates** plus one issuance-time template (`Contract`).
+Series v1 contains **4 deployable templates** plus one issuance-time template (`Contract`).
 
-| #   | Template    | action_data                         | Role                                       | Can be spent to                  | Est. body size |
-| --- | ----------- | ----------------------------------- | ------------------------------------------ | -------------------------------- | -------------- |
-| 0   | `Contract`  | none                                | pre-issuance satoshi reserve               | Normal outputs (issue)           | ~600b          |
-| 1   | `Normal`    | `OP_0`                              | spendable token, supports merge K ∈ [2, 4] | Normal, SwapReady, Frozen, P2PKH | ~2000b         |
-| 2   | `Frozen`    | `OP_2`                              | frozen token, only authority can move      | Normal                           | ~700b          |
-| 3   | `SwapReady` | swap-descriptor (62b, single-level) | token marked for swap                      | Normal, SwapReady (remainder)    | ~1400b         |
+| #   | Template           | action_data                         | Role                                                                                            | Can be spent to                             | Est. body size  |
+| --- | ------------------ | ----------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------- |
+| 0   | `Contract`         | none                                | pre-issuance satoshi reserve                                                                    | NormalBase outputs (issue)                  | ~600b           |
+| 1   | `NormalBase`       | `OP_0`                              | spendable token; paths: transfer/split/merge-K/freeze/confiscate/redeem/prepare-swap-transition | NormalBase, NormalSwapOnRamp, Frozen, P2PKH | ~3000b (target) |
+| 2   | `NormalSwapOnRamp` | `OP_0`                              | owner-initiated swap preparation with issuer attestation                                        | SwapReady (1 path only)                     | ~1500b (target) |
+| 3   | `Frozen`           | `OP_2`                              | frozen token, only authority can move                                                           | NormalBase                                  | ~700b           |
+| 4   | `SwapReady`        | swap-descriptor (62b, single-level) | token marked for swap                                                                           | NormalBase, SwapReady (remainder)           | ~1400b          |
 
-**Whitelist** only contains templates 1–3 (not Contract). Contract is reachable only once (from funding P2PKH) and is not a valid target from any series template. `h_Contract` is NOT part of the whitelist hash.
+**Whitelist** contains templates 1–4 (not Contract). Contract is reachable only once (from funding P2PKH) and is not a valid target from any series template. `h_Contract` is NOT part of the whitelist hash.
 
 ### 3.1 Why Contract is outside the whitelist
 
-Contract is spent exactly once, in the issue transaction. Its outputs are Normal only. Having `h_Contract` in the whitelist would allow arbitrary templates to output Contract-like UTXOs, which is not desirable. Instead, Contract's spend path verifies the ISSUANCE invariants directly, and its outputs must be in whitelist of templates 1–3 (it embeds the same whitelist block).
+Contract is spent exactly once, in the issue transaction. Its outputs are NormalBase only. Having `h_Contract` in the whitelist would allow arbitrary templates to output Contract-like UTXOs, which is not desirable. Instead, Contract's spend path verifies the ISSUANCE invariants directly, and its outputs must be in whitelist of templates 1–4 (it embeds the same whitelist block).
 
-### 3.2 Why single-variant Normal (no N-2/N-4/N-8 split)
+### 3.2 Why NormalBase + NormalSwapOnRamp split (Option A pivot)
 
-Earlier draft proposed three Normal variants (Normal-2, Normal-4, Normal-8) with different merge ceilings. This was dropped in favor of a single Normal template supporting variable K ∈ [2, 4] for the following reasons:
+Earlier draft proposed a single `Normal` template holding all 6 spend paths. Phase 0 pseudo-ASM (`BNTP_TEMPLATE_NORMAL_ASM.md`) showed this body estimate at ~4640b (nearly 2× the 2400b target), with optimized floor ~3600b — still over budget.
+
+The path 3 (prepare-swap with issuer attestation) alone contributed ~695b. Moving it to a dedicated `NormalSwapOnRamp` template:
+
+- Removes ~650-700b from NormalBase → target ~3000b achievable
+- Keeps `NormalSwapOnRamp` focused on a single path → audit-isolation bonus
+- Cost: +1 template in whitelist (128b vs 96b) → +32b per UTXO
+- Size savings vs DSTAS: NormalBase ~3000b UTXO ≈ −28% (still meaningful)
+
+Option A was confirmed via alternatives research (see `BNTP_ALTERNATIVES_RECOMMENDATION.md` §4) as the only feasible design in the trade-off space under current BSV opcodes. Full Phase 0.1 verdict in `BNTP_CRITICAL_REVIEW.md` §8.
+
+### 3.3 Why single-variant Normal (no N-2/N-4/N-8 sub-split)
+
+Earlier draft proposed three Normal variants (Normal-2, Normal-4, Normal-8) with different merge ceilings. This was dropped in favor of a single NormalBase template supporting variable K ∈ [2, 4] for the following reasons:
 
 - Real production usage (per user feedback on DSTAS prod) concentrates around merge-4. Wider (N-8) and narrower (N-2) would be rarely exercised.
 - N-8 feasibility was speculative (7 reconstructions per anchor script might exceed BSV opcode/stack limits).
 - Variant lock-in (merge requires matching variants) would require wallet-level bundling workarounds → added complexity for marginal benefit.
-- Whitelist shrinks from 5 to 3 templates → smaller whitelist block (96b vs 160b) in every template.
+- Whitelist benefits from fewer templates → smaller WHITELIST block.
 - Audit surface reduced ~40%.
 - Future extension (add Normal-2 or Normal-8) is possible in BNTP v1.x as additions to whitelist if prod usage warrants.
 
@@ -89,36 +113,45 @@ Earlier draft proposed three Normal variants (Normal-2, Normal-4, Normal-8) with
 
 ```
 Contract
-  └─(issue,        issuer sig)──► Normal × N        [Σsats_out == contract.sats]
+  └─(issue,                 issuer sig)──► NormalBase × N        [Σsats_out == contract.sats]
 
-Normal
-  ├─(transfer,     owner sig)──► Normal × 1
-  ├─(split,        owner sig)──► Normal × 2..4     [Σ == input]
-  ├─(merge-K,      owner sig)──► Normal × 1..2     [K ∈ [2, 4] STAS inputs]
-  ├─(prepare-swap, owner sig + issuer attestation)─► SwapReady × 1
-  ├─(freeze,       freezeAuth)──► Frozen × 1
-  ├─(confiscate,   confiscAuth)─► Normal × 1       [new owner]
-  └─(redeem,       issuer sig)──► P2PKH + optional Normal × 0..3
+NormalBase
+  ├─(transfer,              owner sig)──► NormalBase × 1
+  ├─(split,                 owner sig)──► NormalBase × 2..4     [Σ == input]
+  ├─(merge-K,               owner sig)──► NormalBase × 1..2     [K ∈ [2, 4] STAS inputs]
+  ├─(prepare-swap-transit.  owner sig)──► NormalSwapOnRamp × 1  [value preserved; owner preserved]
+  ├─(freeze,                freezeAuth)─► Frozen × 1
+  ├─(confiscate,            confiscAuth)► NormalBase × 1        [new owner]
+  └─(redeem,                issuer sig)─► P2PKH + optional NormalBase × 0..3
+
+NormalSwapOnRamp
+  ├─(complete-swap-prep,    owner sig + issuer attestation)─► SwapReady × 1
+  └─(abort-swap-prep,       owner sig)──► NormalBase × 1        [owner backs out, no royalty]
 
 Frozen
-  ├─(unfreeze,     freezeAuth)──► Normal × 1
-  └─(confiscate,   confiscAuth)─► Normal × 1       [new owner]
+  ├─(unfreeze,              freezeAuth)─► NormalBase × 1
+  └─(confiscate,            confiscAuth)► NormalBase × 1        [new owner]
 
 SwapReady
-  ├─(cancel,       owner sig)──► Normal × 1
-  └─(swap-exec,    two owner sigs)─► Normal × 2 +   [the principals]
-                                      SwapReady × 0..2  [remainders keep swap descriptor]
+  ├─(cancel,                owner sig)──► NormalBase × 1
+  └─(swap-exec,             two owner sigs)─► NormalBase × 2 +  [the principals]
+                                               SwapReady × 0..2 [remainders keep swap descriptor]
 ```
 
 ### 4.2 Key transition rules
 
-1. **Merge-K accepts K ∈ [2, 4] inputs.** `followerCount` is pushed explicitly in anchor's unlocking (range 1..3 for K-1 followers). All K STAS inputs MUST be `Normal` (same template, same seriesId, same tokenId).
-2. **Prepare-swap requires issuer attestation.** Owner signature alone is not sufficient; `issuerPkh` (from tail) must sign `(tokenId ‖ thisOutpoint ‖ timestamp)`. Royalty output (P2PKH to issuerPkh, min satoshis TBD) required in same tx. See §9.4.
+1. **Merge-K (K ∈ [2, 4])** is only supported on `NormalBase`. `followerCount` pushed explicitly in anchor's unlocking (range 1..3). All K STAS inputs MUST be `NormalBase` (same template, same seriesId, same tokenId).
+2. **Prepare-swap is TWO-STEP in Option A.** `NormalBase` does NOT directly produce `SwapReady`. Instead:
+   - Step A (on NormalBase): owner-sig-only `prepare-swap-transition` produces a `NormalSwapOnRamp` output. Value and owner preserved. No issuer sig, no royalty required here — purely owner-initiated state move.
+   - Step B (on NormalSwapOnRamp): owner-sig + **issuer attestation** (null-data output, see §9.4) + royalty output produces the final `SwapReady` output.
+   - Rationale: keeps NormalBase body small. Issuer attestation complexity is contained entirely in NormalSwapOnRamp.
+   - Abort path: owner can spend `NormalSwapOnRamp` back to `NormalBase` without issuer involvement if they change their mind before Step B.
 3. **Swap-exec is cross-token.** The two SwapReady inputs may belong to different tokens (different `tokenId`) but MUST belong to the same series (same `seriesId`).
 4. **OptionalData continuity.** Any spend of a token-bearing UTXO must preserve `optionalData` byte-exact in its token-leg output(s). Remainder SwapReady outputs inherit from their source leg. Confiscation outputs retain source `optionalData`. Swap-exec principals inherit `optionalData` from the OPPOSITE leg (since principal receives the other token).
 5. **Redemption PKH** is preserved across all token-leg transitions (identical in all outputs of a token).
-6. **Frozen output cannot originate from SwapReady or Contract.** Frozen state is only reachable from Normal via freeze path.
-7. **Normal satoshi conservation** on all owner-sig paths and on merge. Confiscation preserves satoshis. Redeem can burn (P2PKH + optional remainders) but sum(redeem_P2PKH + remainder_Normal) == input.
+6. **Frozen output cannot originate from SwapReady, NormalSwapOnRamp, or Contract.** Frozen state is only reachable from NormalBase via freeze path.
+7. **Satoshi conservation** on all owner-sig paths and on merge. Confiscation preserves satoshis. Redeem can burn (P2PKH + optional remainders) but sum(redeem_P2PKH + remainder_NormalBase) == input.
+8. **NormalSwapOnRamp is ephemeral.** Not intended as a long-lived state. It exists only between Step A and Step B of prepare-swap, typically in the same mempool window. UTXOs sitting long-term in NormalSwapOnRamp state are treated as "pending, possibly stuck" by indexers.
 
 ---
 
@@ -139,23 +172,26 @@ OP_RETURN
 
 ### 5.1 Variable prefix fields (before OP_2DROP)
 
-| Field      | Size                               | Content                                                |
-| ---------- | ---------------------------------- | ------------------------------------------------------ |
-| Owner      | 20b PKH, or 36..171b MPKH preimage | Spender identity (for Normal/SwapReady owner-sig path) |
-| ActionData | variable (see 5.2)                 | State discriminator                                    |
+| Field      | Size                               | Content                                                  |
+| ---------- | ---------------------------------- | -------------------------------------------------------- |
+| Owner      | 20b PKH, or 36..171b MPKH preimage | Spender identity (for owner-sig paths in all templates)  |
+| ActionData | variable (see 5.2)                 | State-category discriminator (combined with body marker) |
 
 ### 5.2 ActionData per template
 
-| Template  | action_data bytes                                                                                                    | Notes                          |
-| --------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| Contract  | `OP_0` (1 byte, `0x00`)                                                                                              | No state                       |
-| Normal    | `OP_0`                                                                                                               | Normal state                   |
-| Frozen    | `OP_2` (1 byte, `0x52`)                                                                                              | Frozen discriminator           |
-| SwapReady | 62-byte pushdata: `0x01 ‖ requestedScriptHash(32) ‖ requestedPkh(20) ‖ rateNum(4) ‖ rateDenom(4) ‖ reserved(1b = 0)` | Single-level, no `.next` chain |
+| Template         | action_data bytes                                                                                                    | Notes                          |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| Contract         | `OP_0` (1 byte, `0x00`)                                                                                              | No state                       |
+| NormalBase       | `OP_0`                                                                                                               | Normal category                |
+| NormalSwapOnRamp | `OP_0`                                                                                                               | Normal category (ephemeral)    |
+| Frozen           | `OP_2` (1 byte, `0x52`)                                                                                              | Frozen discriminator           |
+| SwapReady        | 62-byte pushdata: `0x01 ‖ requestedScriptHash(32) ‖ requestedPkh(20) ‖ rateNum(4) ‖ rateDenom(4) ‖ reserved(1b = 0)` | Single-level, no `.next` chain |
 
-ActionData MUST be the exclusive state discriminator — a valid series template NEVER has ambiguous action_data. The first byte of action_data determines the state:
+**Note:** NormalBase and NormalSwapOnRamp share the same action_data (`OP_0`). They are distinguished by body marker (§7.4), not by action_data. Action_data is a category discriminator; body marker is the precise template identifier.
 
-- `0x00` (OP_0, empty push) → Normal
+Action_data category → state mapping:
+
+- `0x00` (OP_0, empty push) → Normal category → resolved to NormalBase or NormalSwapOnRamp via body marker
 - `0x52` (OP_2 opcode pushed as-is, or byte `0x52`) → Frozen
 - `0x01` prefix → SwapReady
 
@@ -163,16 +199,32 @@ Any other prefix is invalid.
 
 ### 5.3 Whitelist block
 
-96-byte constant block embedded in all 3 series templates at a **fixed offset** from the end of PREFIX:
+**128-byte** constant block embedded in all 4 series templates **at a fixed offset immediately after PREFIX** (normative rule — see §5.3.1):
 
 ```
-WHITELIST = h_Normal  ‖ h_Frozen  ‖ h_SwapReady
-            (32 bytes × 3 = 96 bytes)
+WHITELIST = h_NormalBase ‖ h_NormalSwapOnRamp ‖ h_Frozen ‖ h_SwapReady
+            (32 bytes × 4 = 128 bytes)
 ```
 
-Each `h_X = SHA256(PREFIX_X ‖ SUFFIX_X)` — the body shape of template X, **excluding** the whitelist block itself. This breaks the self-reference problem: whitelist bytes are not part of their own hash.
+Each `h_X = SHA256(PREFIX_X ‖ SUFFIX_X)` — the body shape of template X, **excluding** the whitelist block itself. This breaks the self-reference problem: whitelist bytes are not part of their own hash. See `BNTP_WHITELIST_COMMITMENT_PROOF.md` for full soundness argument.
 
-All 3 templates in a series share the identical WHITELIST block (byte-for-byte). This enables a simple byte-match check during output verification (§7.3). Contract embeds the same whitelist block for issue-path output validation, though its own `h_Contract` is NOT part of the whitelist.
+All 4 templates in a series share the identical WHITELIST block (byte-for-byte). This enables a simple byte-match check during output verification (§7.2 step 5). Contract embeds the same whitelist block for issue-path output validation, though its own `h_Contract` is NOT part of the whitelist.
+
+**Clarification (S2 AMR #1):** the 96-byte-zero-placeholder used in pseudo-ASM references is never itself a hash input. h_X is computed with PREFIX_X and SUFFIX_X only; WHITELIST bytes (whether zero during template design or real hashes at deployment) are skipped.
+
+**Clarification (S2 AMR #2):** `h_candidate = SHA256(PREFIX_candidate ‖ SUFFIX_candidate)` hashes **raw byte slices** from the output's locking script — not canonicalised opcode representations. This makes pushdata-malleability (e.g., OP_PUSHDATA1 vs OP_PUSHDATA2 for same data) a rejection condition, not a collision risk. Bytes-as-literal is the contract.
+
+### 5.3.1 Normative WHITELIST offset rule (S1 AMR #3)
+
+For output verification to be sound without ambiguity, the WHITELIST block MUST be at a **deterministic byte offset** from the body start. The rule:
+
+```
+body_offset(WHITELIST_start) = sizeof(body_marker) + sizeof(PREFIX) - sizeof(body_marker)
+                             = sizeof(PREFIX_body) [where PREFIX includes the body marker]
+body_offset(WHITELIST_end)   = body_offset(WHITELIST_start) + 128
+```
+
+In practice: PREFIX starts with the 2-byte body marker (§7.4). WHITELIST follows immediately after PREFIX. SUFFIX follows immediately after WHITELIST. This layout MUST hold for all 4 templates in the series; output verification assumes it.
 
 ### 5.4 Tail layout (after `OP_RETURN`)
 
@@ -217,7 +269,7 @@ Semantics:
 
 ```
 seriesId = SHA256(WHITELIST)
-         = SHA256(h_Normal ‖ h_Frozen ‖ h_SwapReady)
+         = SHA256(h_NormalBase ‖ h_NormalSwapOnRamp ‖ h_Frozen ‖ h_SwapReady)
 ```
 
 **Invariant:** seriesId uniquely identifies a deployment of BNTP v1 templates. Two tokens with identical seriesId belong to the same closed family — they could (in principle) be swapped across tokens without template mismatch (but `tokenId` prevents cross-token misuse in regular spends).
@@ -266,17 +318,26 @@ For each candidate series output:
    - action_data push (variable width, per §5.2)
    - **OP_2DROP** marker (1 byte)
    - body starts here
-3. From body, read fixed-length PREFIX (length known per template). Body marker byte at start of PREFIX (§7.4) disambiguates which of 3 templates this is, so PREFIX length is known post-dispatch.
-4. Extract WHITELIST block (96 bytes at fixed offset from body start, after PREFIX).
-5. **Byte-match** `output.WHITELIST == this.WHITELIST` (96 bytes compared via `OP_EQUALVERIFY` after concat). This anchors the output to this series.
+3. From body, read fixed-length PREFIX (length known per template). Body marker byte at start of PREFIX (§7.4) disambiguates which of 4 templates this is, so PREFIX length is known post-dispatch.
+4. Extract WHITELIST block (128 bytes at fixed offset from body start — normative rule §5.3.1 — immediately after PREFIX).
+5. **Byte-match** `output.WHITELIST == this.WHITELIST` (128 bytes compared via `OP_EQUALVERIFY` after concat). This anchors the output to this series.
 6. Compute `h_candidate = SHA256(PREFIX_extracted ‖ SUFFIX_extracted)` (omit WHITELIST).
-7. Verify `h_candidate ∈ {h_Normal, h_Frozen, h_SwapReady}` by comparing against the 3 hashes in the embedded WHITELIST.
+7. Verify `h_candidate ∈ {h_NormalBase, h_NormalSwapOnRamp, h_Frozen, h_SwapReady}` by comparing against the 4 hashes in the embedded WHITELIST.
 
 This combination (steps 5 + 7) guarantees:
 
 - The output belongs to this specific series (whitelist bytes identical)
-- The output uses one of the 3 known template bodies (hash in the embedded list)
+- The output uses one of the 4 known template bodies (hash in the embedded list)
 - No self-reference loop (hash doesn't include whitelist bytes)
+
+**Per-path output-template restrictions (S2 AMR #3):** each spend path MAY restrict which subset of the 4 whitelist hashes are acceptable for its outputs. For example:
+
+- NormalBase path 1 (transfer/split) accepts only `h_NormalBase` for token-leg outputs
+- NormalBase path 7 (prepare-swap-transition) accepts only `h_NormalSwapOnRamp` for the single token-leg output
+- NormalBase path 4 (freeze) accepts only `h_Frozen`
+- NormalSwapOnRamp path (complete-swap-prep) accepts only `h_SwapReady`
+
+The whitelist provides the **superset** of series-valid templates; each path narrows it further. Contract's issue path accepts only `h_NormalBase` (step 7 check collapses to single hash).
 
 ### 7.3 Tail consistency check
 
@@ -294,12 +355,13 @@ Because Normal-2/4/8 have different PREFIX lengths (logic size differs), the spl
 
 **Option A (data marker per template):** each template body starts with a unique 2-byte prefix:
 
-| Template  | Body marker | Purpose                                             |
-| --------- | ----------- | --------------------------------------------------- |
-| Normal    | `0x01 0xff` | Normal spendable template                           |
-| Frozen    | `0xfe 0xff` | Frozen template                                     |
-| SwapReady | `0x0f 0xff` | SwapReady template                                  |
-| Contract  | `0xc0 0xff` | Contract (not in whitelist, but uses same dispatch) |
+| Template         | Body marker | Purpose                                                |
+| ---------------- | ----------- | ------------------------------------------------------ |
+| NormalBase       | `0x01 0xff` | Normal spendable template (all paths except prep-swap) |
+| NormalSwapOnRamp | `0x02 0xff` | Swap-preparation transition template                   |
+| Frozen           | `0xfe 0xff` | Frozen template                                        |
+| SwapReady        | `0x0f 0xff` | SwapReady template                                     |
+| Contract         | `0xc0 0xff` | Contract (not in whitelist, but uses same dispatch)    |
 
 Script reads 2 bytes, branches on value to known PREFIX length.
 
@@ -307,7 +369,9 @@ Script reads 2 bytes, branches on value to known PREFIX length.
 
 **Recommendation:** Option A (fixed 2-byte tag). Adds 2 bytes per template, known offsets for all templates. This is the **body marker** (analogous to DSTAS 1.0.4's `0x540b` marker, but carrying semantics).
 
-**Constraint:** body marker values are frozen at v1 spec lock. Any future template addition (v1.x) MUST pick a value not colliding with {0x01ff, 0xfeff, 0x0fff, 0xc0ff} and update the whitelist accordingly.
+**Constraint:** body marker values are frozen at v1 spec lock. Any future template addition (v1.x) MUST pick a value not colliding with {0x01ff, 0x02ff, 0xfeff, 0x0fff, 0xc0ff} and update the whitelist accordingly.
+
+**Output-body-marker gating per path (S2 AMR #3 refinement):** each spend path validates not only that output's `h_candidate` is in the whitelist, but also that the output's body marker matches the specific expected template for this spend path's target. This prevents marker-confusion attacks where attacker crafts an output with marker of template A but WHITELIST/SUFFIX of template B.
 
 ### 7.5 Output ordering rule
 
@@ -380,20 +444,24 @@ Unlocking script always ends with:
 
 `spend_path_id` is an explicit small integer that disambiguates WHICH path within a template is being used. Values are template-scoped (not global):
 
-| path_id | Normal               | Frozen     | SwapReady | Contract |
-| ------- | -------------------- | ---------- | --------- | -------- |
-| 1       | transfer/split       | —          | —         | —        |
-| 2       | merge-K (K ∈ [2, 4]) | —          | —         | —        |
-| 3       | prepare-swap         | —          | cancel    | —        |
-| 4       | freeze               | unfreeze   | —         | —        |
-| 5       | confiscate           | confiscate | —         | —        |
-| 6       | redeem               | —          | —         | —        |
-| 7       | —                    | —          | swap-exec | —        |
-| 8       | —                    | —          | —         | issue    |
+| path_id | NormalBase              | NormalSwapOnRamp   | Frozen     | SwapReady | Contract |
+| ------- | ----------------------- | ------------------ | ---------- | --------- | -------- |
+| 1       | transfer/split          | abort-swap-prep    | —          | cancel    | —        |
+| 2       | merge-K (K ∈ [2, 4])    | —                  | —          | —         | —        |
+| 3       | prepare-swap-transition | complete-swap-prep | —          | —         | —        |
+| 4       | freeze                  | —                  | unfreeze   | —         | —        |
+| 5       | confiscate              | —                  | confiscate | —         | —        |
+| 6       | redeem                  | —                  | —          | —         | —        |
+| 7       | —                       | —                  | —          | swap-exec | —        |
+| 8       | —                       | —                  | —          | —         | issue    |
 
-Path_id is pushed as OP_1..OP_8. Script does `OP_DUP OP_1 OP_8 OP_WITHIN OP_VERIFY` then dispatches.
+Path_id is pushed as OP_1..OP_8. Each template script validates `path_id ∈ WHERE dispatching` via `OP_DUP OP_1 OP_8 OP_WITHIN OP_VERIFY` then branches.
 
-### 9.2 Normal, path 1 (transfer/split)
+**Note on path 3 semantics:** in NormalBase, path 3 is `prepare-swap-transition` (owner only, no attestation, no royalty, produces NormalSwapOnRamp). In NormalSwapOnRamp, path 3 is `complete-swap-prep` (owner + issuer attestation + royalty, produces SwapReady). Same path_id, different semantics per template — consistent with two-step flow (§4.2 rule 2).
+
+**Note on path 1 semantics:** in NormalBase, path 1 is transfer/split (produces 1..4 NormalBase). In NormalSwapOnRamp, path 1 is `abort-swap-prep` (produces 1 NormalBase, no royalty, owner backs out). In SwapReady, path 1 is `cancel` (produces 1 NormalBase, owner aborts the swap offering).
+
+### 9.2 NormalBase, path 1 (transfer/split)
 
 **Unlocking:**
 
@@ -448,7 +516,7 @@ Script verifies:
 
 **Funding input:** detected by SDK at signing time (non-BNTP input in tx). Must be exactly one non-STAS input, else script fails (structural constraint; see `BNTP_INVARIANTS.md`).
 
-### 9.3 Normal, path 2 (merge-K, K ∈ [2, 4])
+### 9.3 NormalBase, path 2 (merge-K, K ∈ [2, 4])
 
 A single Normal template supports merging 2, 3, or 4 inputs. `followerCount = K - 1` is pushed explicitly in anchor unlocking and verified `∈ [1, 3]`.
 
@@ -536,40 +604,29 @@ Follower script verifies:
 - Unlocking size anchor: ~230 + (K-1)×2500b prev tx pieces
 - Unlocking size follower: ~230 + 2500b (anchor's prev tx)
 
-### 9.4 Normal, path 3 (prepare-swap) — requires issuer attestation (Способ C)
+### 9.4 Prepare-swap is a TWO-STEP flow (Option A)
 
-Prepare-swap is the **only on-ramp to SwapReady state**. It requires an issuer signature (single-sig or MPKH per tail flags) over a canonical attestation message, plus a royalty output in the same tx. This gives off-chain back-to-genesis validation as a gating mechanism for DEX participation.
+To keep `NormalBase` body within budget, entering `SwapReady` state requires **two transactions**, governed by two different templates:
 
-**Output layout:**
+- **Step A: NormalBase path 3 (prepare-swap-transition)** — owner-sig only, no issuer involvement. Transitions NormalBase → NormalSwapOnRamp. Cheap, owner can abort any time via path 1 (abort-swap-prep).
+- **Step B: NormalSwapOnRamp path 3 (complete-swap-prep)** — owner-sig + issuer attestation (null-data output) + royalty output. Transitions NormalSwapOnRamp → SwapReady.
 
-- Output 0: SwapReady (token-leg, owner's chosen swap descriptor)
-- Output 1: null-data (optional)
-- Output 2: P2PKH change (optional)
-- Output N: P2PKH royalty to `issuerPkh` (REQUIRED, min satoshis TBD in SDK config)
+**Rationale for two-step:** issuer attestation logic (null-data parsing, hash binding, CHECKSIG against arbitrary data) is expensive in pseudo-ASM. Moving it out of `NormalBase` into dedicated `NormalSwapOnRamp` keeps NormalBase body within ≤3000b. NormalSwapOnRamp is a small dedicated template (~1500b) focused only on the swap-prep completion.
 
-Royalty output is structurally required; its satoshis amount is issuer-policy (SDK default: 1000 sats, configurable via issuer service).
+**AMR #1 redesign:** The issuer attestation mechanism uses **null-data output covered by SIGHASH_ALL**, not a second generator-point CHECKSIG-over-hash pattern. See §9.4.2 below.
 
-**Attestation message:**
+#### 9.4.1 NormalBase path 3 — prepare-swap-transition
 
-```
-attestation_msg = tokenId(32b) ‖ thisOutpoint(36b) ‖ timestamp(8b LE)
-```
-
-`timestamp` is issuer-chosen (e.g., unix seconds), pushed in unlocking. Script does NOT enforce timestamp freshness on-chain (stateless); SDK/issuer enforces TTL off-chain by checking against current block height or wall-clock.
+Owner-initiated state move from `NormalBase` to `NormalSwapOnRamp`. No issuer, no royalty. Just a state rename with preserved value + owner + token fields.
 
 **Unlocking:**
 
 ```
-[swap_output_satoshis]
-[swap_output_owner]
-[swap_descriptor 62b]             first byte 0x01 + requestedScriptHash + requestedPkh + rate + reserved
-[SwapReady body_marker 0x0fff]
+[nso_output_satoshis]              must == this.satoshis
+[nso_output_owner]                 must == this.owner
+[NormalSwapOnRamp body_marker 0x02ff]
 [null-data?]
 [funding_txid] [funding_vout]
-[royalty_satoshis]
-[attestation_timestamp 8b]
-[issuer_attestation_sig]          DER-encoded; or [OP_0, sig_1..sig_m, mpkh_preimage] for MPKH issuer
-[issuer_pubkey]                   absent for MPKH issuer
 [preimage]
 [OP_3]                            path_id = 3
 [owner_sig]
@@ -579,29 +636,136 @@ attestation_msg = tokenId(32b) ‖ thisOutpoint(36b) ‖ timestamp(8b LE)
 Script verifies:
 
 1. Owner sig valid against preimage, `HASH160(owner_pubkey) == owner_field_from_scriptCode`
-2. Exactly 1 token-leg output (output 0), body_marker = 0x0fff (SwapReady)
+2. Exactly 1 token-leg output at index 0, body_marker = 0x02ff (NormalSwapOnRamp)
+3. Satoshis preserved: `nso_output_satoshis == this.satoshis`
+4. Owner preserved: `nso_output_owner == this.owner`
+5. Tail fields match (same token, same series)
+6. HashOutputs covenant matches
+
+Output-body-marker restriction: only `h_NormalSwapOnRamp` is acceptable as target for this path (§7.2 gating).
+
+#### 9.4.2 NormalSwapOnRamp path 3 — complete-swap-prep (with issuer attestation)
+
+This is where the DEX back-to-genesis gate is enforced on-chain. Owner has already transitioned to `NormalSwapOnRamp`; now, with issuer's approval, they complete the move to `SwapReady`.
+
+**Output layout:**
+
+```
+Output 0: SwapReady (token-leg, with swap descriptor)
+Output 1: null-data — issuer attestation (REQUIRED at this fixed index)
+Output 2: P2PKH royalty to issuerPkh (REQUIRED)
+Output 3: null-data (optional message)
+Output 4: P2PKH change (optional)
+```
+
+**Null-data attestation format (at output index 1):**
+
+```
+scriptPubKey = OP_FALSE OP_RETURN
+               <tokenId 32b>           attestation field #1
+               <thisOutpoint 36b>      attestation field #2 (current UTXO's outpoint)
+               <timestamp 8b LE>       attestation field #3 (issuer-chosen, unix seconds)
+               <issuerPubkey 33b>      attestation field #4 (issuer's compressed pubkey, or MPKH preimage)
+satoshis = 0
+```
+
+**Issuer attestation mechanism (AMR #1 redesign — null-data + SIGHASH_ALL):**
+
+Instead of asking the script to CHECKSIG over `HASH256(tokenId ‖ outpoint ‖ timestamp)` — which BSV Script cannot natively do — we exploit the fact that `hashOutputs` in the preimage (under SIGHASH_ALL) commits to ALL outputs, including the null-data attestation.
+
+Therefore:
+
+1. User constructs the full tx (including null-data attestation output).
+2. User asks issuer to sign the **transaction preimage** (SIGHASH_ALL | SIGHASH_FORKID = 0x41).
+3. Issuer verifies: tokenId belongs to them, chain is OK off-chain (back-to-genesis check), attestation fields in the null-data output match expectations, royalty output is present.
+4. If all checks pass, issuer returns signature.
+5. User inserts signature into unlocking, broadcasts.
+
+Script verifies at spend time:
+
+1. Owner sig valid against preimage
+2. Exactly 1 token-leg output at index 0, body_marker = 0x0fff (SwapReady)
 3. Its swap_descriptor well-formed: first byte `0x01`, requestedScriptHash 32b, requestedPkh 20b, rateNum 4b, rateDenom 4b, reserved 1b = 0x00
-4. Satoshis preserved: `swap_output_satoshis == this.satoshis` (no value transfer)
+4. Satoshis preserved: `swap_output_satoshis == this.satoshis`
 5. Owner in SwapReady output == this.owner
 6. Tail fields match (same token, same series)
-7. **Royalty check:** there exists output at index ≥1 with `scriptPubKey = P2PKH(issuerPkh_from_tail)` and `satoshis ≥ royaltyMin` (royaltyMin is embedded constant in template; TBD during pseudo-ASM, suggested default 1000 sats)
-8. **Issuer attestation:**
-   - Build `attestation_msg = this.tokenId ‖ this.outpoint ‖ attestation_timestamp`
-   - Compute `attestation_hash = HASH256(attestation_msg)`
-   - For single-sig issuer: `HASH160(issuer_pubkey) == this.issuerPkh`, `CHECKSIGVERIFY(issuer_attestation_sig, issuer_pubkey, attestation_hash)`
-   - For MPKH issuer (authorityFlags bit 4): `HASH160(mpkh_preimage) == this.issuerPkh`, `CHECKMULTISIGVERIFY` against MPKH preimage pubkey set and attestation_hash
-9. **HashOutputs covenant:** output reconstruction (SwapReady + null-data + change + royalty) matches `hashOutputs` from preimage
+7. **Null-data attestation output** at index 1:
+   - scriptPubKey starts with `0x00 0x6a` (OP_FALSE OP_RETURN)
+   - Contains pushed fields at expected byte offsets
+   - `attestation_tokenId == this.tokenId`
+   - `attestation_outpoint == thisOutpoint` (from preimage)
+   - `attestation_pubkey HASH160 == this.issuerPkh` (for single-sig issuer) OR `attestation_pubkey HASH160 == this.issuerPkh` (for MPKH, where `attestation_pubkey` field carries MPKH preimage)
+   - `attestation_satoshis == 0` (null-data convention)
+8. **Royalty output** at index 2:
+   - scriptPubKey = P2PKH(issuerPkh)
+   - satoshis ≥ royaltyMin (embedded template constant)
+9. **Issuer signature valid against the tx preimage** via standard CHECKSIGVERIFY — this is the normal covenant mechanism. Because SIGHASH_ALL binds the null-data content, a valid issuer signature implies the null-data attestation bytes are issuer-approved.
+10. HashOutputs covenant matches reconstruction
+
+**Unlocking:**
+
+```
+[swap_output_satoshis]
+[swap_output_owner]
+[swap_descriptor 62b]
+[SwapReady body_marker 0x0fff]
+[null-data-attestation bytes]        full null-data scriptPubKey (for reconstruction)
+[royalty_satoshis]
+[null-data-msg?]                      optional output 3 null-data
+[change_satoshis] [change_script?]    optional output 4 P2PKH change
+[funding_txid] [funding_vout]
+[issuer_sig]                          DER-encoded; covers preimage via SIGHASH_ALL
+[issuer_pubkey]                       or absent for MPKH (preimage carried in null-data)
+[preimage]
+[OP_3]                                path_id = 3
+[owner_sig]
+[owner_pubkey]
+```
 
 **Security model notes:**
 
-- Issuer signature is over `(tokenId, outpoint, timestamp)` — specific to THIS UTXO at THIS moment. Can't be replayed to a different outpoint.
-- Issuer signs only after off-chain back-to-genesis verification → gates entry to SwapReady.
-- Issuer compromise → all future attestations trustless (same as DSTAS confisc auth compromise).
+- Issuer signature covers the entire tx via `hashOutputs`. Therefore, an issuer sig implies approval of ALL tx fields including null-data attestation content. This is stronger than signing just `HASH256(tokenId ‖ outpoint ‖ timestamp)` because issuer also implicitly approves royalty amount, change output, etc.
+- Issuer can refuse to sign if the tx is malicious (unreasonable royalty, wrong owner, etc.).
 - Timestamp is advisory; on-chain script does NOT verify freshness. SDK/indexer uses timestamp to reject stale SwapReady during discovery.
+- Issuer compromise → all future attestations trustless (equivalent severity to DSTAS confisc auth compromise). Mitigate via MPKH issuer (authorityFlags bit 4).
+- Replay protection: `thisOutpoint` in attestation binds to a specific UTXO; issuer's signature over preimage binds to the specific spend tx. Issuer cannot be tricked into signing the same attestation for a different UTXO.
 
-**Constraint:** prepare-swap does NOT allow changing owner or value. It's a pure state transition Normal → SwapReady, gated by issuer.
+**Size implication:**
 
-### 9.5 Normal, paths 4 & 5 (freeze, confiscate)
+- Attestation verification in NormalSwapOnRamp: ~100-130b (parsing null-data fields, byte comparisons, standard CHECKSIG) vs ~200b for the original CHECKSIG-over-hash alternative.
+- Extra output in tx: ~50-70b null-data bytes.
+- Net win: template body saves ~70-100b; tx grows ~50-70b. Worth the trade.
+
+#### 9.4.3 NormalSwapOnRamp path 1 — abort-swap-prep
+
+Owner backs out of swap preparation before issuer completes attestation. Produces NormalBase, restoring the original state.
+
+**Unlocking:**
+
+```
+[nb_output_satoshis]               must == this.satoshis
+[nb_output_owner]                  must == this.owner
+[NormalBase body_marker 0x01ff]
+[null-data?]
+[funding_txid] [funding_vout]
+[preimage]
+[OP_1]                            path_id = 1
+[owner_sig]
+[owner_pubkey]
+```
+
+Script verifies:
+
+1. Owner sig valid
+2. Exactly 1 token-leg output at index 0, body_marker = 0x01ff (NormalBase)
+3. Satoshis preserved
+4. Owner preserved
+5. Tail fields match
+6. HashOutputs covenant matches
+
+No issuer, no royalty — this is a pure ownership-controlled reversal.
+
+### 9.5 NormalBase, paths 4 & 5 (freeze, confiscate)
 
 **Freeze (path 4):**
 
@@ -647,15 +811,15 @@ Script verifies:
 2. Authority signature valid against `confiscAuthHash`
 3. Exactly 1 Normal output (body_marker 0x01ff), satoshis preserved, same token, new owner free
 
-### 9.6 Normal, path 6 (redeem, issuer only)
+### 9.6 NormalBase, path 6 (redeem, issuer only)
 
-Issuer burns all or part of a token leg by producing a P2PKH output to `redemptionPkh` plus optional Normal remainders.
+Issuer burns all or part of a token leg by producing a P2PKH output to `redemptionPkh` plus optional NormalBase remainders.
 
 **Unlocking:**
 
 ```
 [P2PKH_output_satoshis]
-[Normal_remainder_tuples ...]     0..3 remainders
+[NormalBase_remainder_tuples ...] 0..3 remainders
 [null-data?]
 [funding_txid] [funding_vout]
 [preimage]
@@ -667,20 +831,20 @@ Issuer burns all or part of a token leg by producing a P2PKH output to `redempti
 Script verifies:
 
 1. Output 0 is P2PKH with hash == `redemptionPkh`
-2. Outputs 1..R are Normal (body_marker 0x01ff), same token (R ∈ 0..3)
-3. `Σ (P2PKH.satoshis + Σ Normal.satoshis) == this.satoshis`
+2. Outputs 1..R are NormalBase (body_marker 0x01ff), same token (R ∈ 0..3)
+3. `Σ (P2PKH.satoshis + Σ NormalBase.satoshis) == this.satoshis`
 4. Issuer identity verified per §8.4: single-sig (`HASH160(issuer_pubkey) == issuerPkh` + `CHECKSIG` against preimage), or MPKH (hash preimage, CHECKMULTISIG)
 
 ### 9.7 Frozen, paths 4 & 5 (unfreeze, confiscate)
 
 **Unfreeze (path 4):**
 
-Unlocking provides freeze authority sig. Output: 1 Normal UTXO, same token, same owner, same value.
+Unlocking provides freeze authority sig. Output: 1 NormalBase UTXO, same token, same owner, same value.
 
 ```
-[normal_output_satoshis]          == this.satoshis
-[normal_output_owner]             == this.owner
-[Normal body_marker 0x01ff]
+[nb_output_satoshis]              == this.satoshis
+[nb_output_owner]                 == this.owner
+[NormalBase body_marker 0x01ff]
 [null-data?]
 [funding_txid] [funding_vout]
 [preimage]
@@ -688,22 +852,22 @@ Unlocking provides freeze authority sig. Output: 1 Normal UTXO, same token, same
 [auth_sig] [auth_pubkey]          or MPKH form
 ```
 
-Verification parallels freeze but reverses the state (Frozen → Normal).
+Verification parallels freeze but reverses the state (Frozen → NormalBase).
 
-**Confiscate from Frozen (path 5):** same as Normal confiscate but source is Frozen. New owner free; output is Normal.
+**Confiscate from Frozen (path 5):** same as NormalBase confiscate but source is Frozen. New owner free; output is NormalBase.
 
-### 9.8 SwapReady, path 3 (cancel)
+### 9.8 SwapReady, path 1 (cancel)
 
-Owner cancels their swap and returns to Normal.
+Owner cancels their swap and returns to NormalBase. Note: path_id for SwapReady cancel is **1**, not 3 (per updated dispatch table §9.1).
 
 ```
-[normal_output_satoshis]          == this.satoshis
-[normal_output_owner]             == this.owner
-[Normal body_marker 0x01ff]
+[nb_output_satoshis]              == this.satoshis
+[nb_output_owner]                 == this.owner
+[NormalBase body_marker 0x01ff]
 [null-data?]
 [funding_txid] [funding_vout]
 [preimage]
-[OP_3]                            path_id = 3 in SwapReady context
+[OP_1]                            path_id = 1 in SwapReady context
 [sig]
 [pubKey]
 ```
@@ -711,9 +875,9 @@ Owner cancels their swap and returns to Normal.
 Script verifies:
 
 1. Owner sig valid
-2. Exactly 1 Normal output, same owner, same satoshis, same token (tokenId, redemptionPkh, issuerPkh, authority, optionalData preserved)
+2. Exactly 1 NormalBase output, same owner, same satoshis, same token (tokenId, redemptionPkh, issuerPkh, authority, optionalData preserved)
 
-### 9.9 SwapReady, path 7 (swap-exec)
+### 9.9 SwapReady, path 7 (swap-exec — cross-token)
 
 The complex one. Two SwapReady inputs, each with their own swap descriptor. Cross-token.
 
@@ -736,8 +900,8 @@ Both legs MUST have matching `requestedScriptHash` pointing at each other's coun
 **Output layout:**
 
 ```
-Output 0: Normal-Y_A, owner = leg_A.swap.requestedPkh, satoshis = X_A        [principal A]
-Output 1: Normal-Y_B, owner = leg_B.swap.requestedPkh, satoshis = X_B        [principal B]
+Output 0: NormalBase, owner = leg_A.swap.requestedPkh, satoshis = X_A        [principal A]
+Output 1: NormalBase, owner = leg_B.swap.requestedPkh, satoshis = X_B        [principal B]
 Output 2: SwapReady remainder for leg A     (if leg A had leftover)           [optional]
 Output 3: SwapReady remainder for leg B     (if leg B had leftover)           [optional]
 Output K: null-data                                                           [optional]
@@ -827,20 +991,22 @@ Floor-rounding loss is capped at `rateDenom - 1` satoshis per execution. SDK sho
 
 For quick reference, unlocking push sequence per template × path:
 
-| Template  | Path               | Path_id | Key pushes (from top of stack down, reversed for order into stack)                                                                                                       |
-| --------- | ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Normal    | transfer/split     | 1       | pubKey, sig, OP_1, preimage, funding_outpoint, null-data?, output_tuples…                                                                                                |
-| Normal    | merge-K (anchor)   | 2       | pubKey, sig, OP_2, preimage, all_input_outpoints, followerCount, follower-data × (K-1), funding_outpoint, null-data?, output_tuples…                                     |
-| Normal    | merge-K (follower) | 2       | pubKey, sig, OP_2, preimage, selfPosition, all_input_outpoints, anchor-data                                                                                              |
-| Normal    | prepare-swap       | 3       | owner_pubkey, owner_sig, OP_3, preimage, issuer_pubkey, issuer_attestation_sig, attestation_timestamp, royalty_satoshis, funding_outpoint, null-data?, swap_output_tuple |
-| Normal    | freeze             | 4       | auth_pubkey, auth_sig, OP_4, preimage, funding_outpoint, null-data?, frozen_output_tuple                                                                                 |
-| Normal    | confiscate         | 5       | auth_pubkey, auth_sig, OP_5, preimage, funding_outpoint, null-data?, normal_output_tuple                                                                                 |
-| Normal    | redeem             | 6       | issuer_pubkey, issuer_sig, OP_6, preimage, funding_outpoint, null-data?, remainders…, p2pkh_sats                                                                         |
-| Frozen    | unfreeze           | 4       | auth_pubkey, auth_sig, OP_4, preimage, funding_outpoint, null-data?, normal_output_tuple                                                                                 |
-| Frozen    | confiscate         | 5       | auth_pubkey, auth_sig, OP_5, preimage, funding_outpoint, null-data?, normal_output_tuple                                                                                 |
-| SwapReady | cancel             | 3       | pubKey, sig, OP_3, preimage, funding_outpoint, null-data?, normal_output_tuple                                                                                           |
-| SwapReady | swap-exec          | 7       | pubKey, sig, OP_7, preimage, funding_outpoint, null-data?, output_tuples, other_leg_pieces, other_leg_counterparty_script                                                |
-| Contract  | issue              | 8       | issuer_pubkey, issuer_sig, OP_8, preimage, genesisTxId, funding_outpoint, null-data?, output_tuples                                                                      |
+| Template         | Path                    | Path_id | Key pushes (from top of stack down, reversed for order into stack)                                                                                                          |
+| ---------------- | ----------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NormalBase       | transfer/split          | 1       | pubKey, sig, OP_1, preimage, funding_outpoint, null-data?, output_tuples (NormalBase)…                                                                                      |
+| NormalBase       | merge-K (anchor)        | 2       | pubKey, sig, OP_2, preimage, all_input_outpoints, followerCount, follower-data × (K-1), funding_outpoint, null-data?, output_tuples                                         |
+| NormalBase       | merge-K (follower)      | 2       | pubKey, sig, OP_2, preimage, selfPosition, all_input_outpoints, anchor-data                                                                                                 |
+| NormalBase       | prepare-swap-transition | 3       | owner_pubkey, owner_sig, OP_3, preimage, funding_outpoint, null-data?, nso_output_tuple (NormalSwapOnRamp target)                                                           |
+| NormalBase       | freeze                  | 4       | auth_pubkey, auth_sig, OP_4, preimage, funding_outpoint, null-data?, frozen_output_tuple                                                                                    |
+| NormalBase       | confiscate              | 5       | auth_pubkey, auth_sig, OP_5, preimage, funding_outpoint, null-data?, nb_output_tuple                                                                                        |
+| NormalBase       | redeem                  | 6       | issuer_pubkey, issuer_sig, OP_6, preimage, funding_outpoint, null-data?, remainders (NormalBase)…, p2pkh_sats                                                               |
+| NormalSwapOnRamp | abort-swap-prep         | 1       | owner_pubkey, owner_sig, OP_1, preimage, funding_outpoint, null-data?, nb_output_tuple (NormalBase target)                                                                  |
+| NormalSwapOnRamp | complete-swap-prep      | 3       | owner_pubkey, owner_sig, OP_3, preimage, issuer_pubkey, issuer_sig, funding_outpoint, change?, null-data?, royalty_satoshis, attestation_null_data_bytes, swap_output_tuple |
+| Frozen           | unfreeze                | 4       | auth_pubkey, auth_sig, OP_4, preimage, funding_outpoint, null-data?, nb_output_tuple                                                                                        |
+| Frozen           | confiscate              | 5       | auth_pubkey, auth_sig, OP_5, preimage, funding_outpoint, null-data?, nb_output_tuple                                                                                        |
+| SwapReady        | cancel                  | 1       | pubKey, sig, OP_1, preimage, funding_outpoint, null-data?, nb_output_tuple                                                                                                  |
+| SwapReady        | swap-exec               | 7       | pubKey, sig, OP_7, preimage, funding_outpoint, null-data?, output_tuples, other_leg_pieces, other_leg_counterparty_script                                                   |
+| Contract         | issue                   | 8       | issuer_pubkey, issuer_sig, OP_8, preimage, genesisTxId, funding_outpoint, null-data?, output_tuples (NormalBase)                                                            |
 
 All output_tuples are pushed in reverse order (last output first, so they pop in forward order during script reconstruction).
 
@@ -850,14 +1016,20 @@ All output_tuples are pushed in reverse order (last output first, so they pop in
 
 ### 12.1 Template body (PREFIX + WHITELIST + SUFFIX)
 
-| Template  | PREFIX | WHITELIST | SUFFIX | Body marker | **Body total** |
-| --------- | ------ | --------- | ------ | ----------- | -------------- |
-| Normal    | ~1050b | 96b       | ~850b  | 2b          | ~2000b         |
-| Frozen    | ~350b  | 96b       | ~250b  | 2b          | ~700b          |
-| SwapReady | ~750b  | 96b       | ~550b  | 2b          | ~1400b         |
-| Contract  | ~300b  | 96b       | ~200b  | 2b          | ~600b          |
+| Template         | PREFIX | WHITELIST | SUFFIX | Body marker | **Body total**      | Notes                                                |
+| ---------------- | ------ | --------- | ------ | ----------- | ------------------- | ---------------------------------------------------- |
+| NormalBase       | ~1100b | 128b      | ~1770b | 2b          | **~3000b (target)** | 6 paths; largest template; merge-K dominates         |
+| NormalSwapOnRamp | ~900b  | 128b      | ~470b  | 2b          | **~1500b (target)** | 2 paths (abort, complete-swap-prep with attestation) |
+| Frozen           | ~400b  | 128b      | ~230b  | 2b          | **~760b**           | 2 paths (unfreeze, confiscate)                       |
+| SwapReady        | ~800b  | 128b      | ~570b  | 2b          | **~1500b**          | 2 paths (cancel, swap-exec)                          |
+| Contract         | ~350b  | 128b      | ~220b  | 2b          | **~700b**           | 1 path (issue)                                       |
 
-These are rough estimates pre-ASM. Actual numbers TBD after pseudo-ASM pass per template. Normal template's ~2000b body accounts for: 3-in-1 spend path dispatcher, merge-K anchor+follower logic (K ∈ [2, 4]), output verification, issuer attestation verify on prepare-swap path.
+**Budget gates (per `BNTP_CRITICAL_REVIEW.md` §5.1):**
+
+- NormalBase ≤ 3000b: G4 PASS → proceed to Phase 1
+- 3000 < NormalBase ≤ 3200b: G4 PASS-with-margin; proceed cautiously
+- 3200 < NormalBase ≤ 3400b: G4 PIVOT; drop or defer a feature (e.g., K=4 merge → K=2 only)
+- NormalBase > 3400b: G4 ABORT; revisit Option B (drop prepare-swap from protocol)
 
 ### 12.2 Per-UTXO on-chain size (owner 20b PKH, no optionalData)
 
@@ -876,31 +1048,36 @@ UTXO_size = 1 (OP_PUSH20) + 20 (owner) + 1..2 (action_data push)
           + optionalData (0 here)
 ```
 
-Fixed tail overhead = ~175b.
+Fixed tail overhead = ~175b. WHITELIST is now 128b (+32b vs earlier 96b estimate).
 
-| State     | Body | Tail | Action data | **Per-UTXO total** | vs DSTAS 1.0.4 (~3050b) |
-| --------- | ---- | ---- | ----------- | ------------------ | ----------------------- |
-| Normal    | 2000 | 175  | 1           | **~2200b**         | **−28%**                |
-| Frozen    | 700  | 175  | 1           | **~900b**          | **−70%**                |
-| SwapReady | 1400 | 175  | 63          | **~1660b**         | **−46%**                |
-| Contract  | 600  | 175  | 1           | **~800b**          | new                     |
+| State            | Body | Tail | Action data | **Per-UTXO total** | vs DSTAS 1.0.4 (~3050b) |
+| ---------------- | ---- | ---- | ----------- | ------------------ | ----------------------- |
+| NormalBase       | 3000 | 175  | 1           | **~3200b**         | **−5%** (modest)        |
+| NormalSwapOnRamp | 1500 | 175  | 1           | **~1700b**         | **−44%** (ephemeral)    |
+| Frozen           | 760  | 175  | 1           | **~960b**          | **−68%**                |
+| SwapReady        | 1500 | 175  | 63          | **~1760b**         | **−42%**                |
+| Contract         | 700  | 175  | 1           | **~900b**          | new                     |
+
+**Honest update:** NormalBase's per-UTXO footprint at ~3200b gives only ~5% savings vs DSTAS 1.0.4's ~3050b — **much smaller than previously advertised**. The big wins remain on Frozen (−68%) and SwapReady (−42%). See `BNTP_ALTERNATIVES_RECOMMENDATION.md` §4 for why this trade-off is still net positive.
 
 ### 12.3 Unlocking script size (examples, no MPKH)
 
-| Path                               | Approx. size                                         |
-| ---------------------------------- | ---------------------------------------------------- |
-| Normal transfer (1 output, change) | ~230b                                                |
-| Normal split (4 outputs, change)   | ~380b                                                |
-| Normal merge-2 (anchor)            | ~340 + 1 × 2500b = ~2840b                            |
-| Normal merge-4 (anchor)            | ~380 + 3 × 2500b = ~7880b                            |
-| Normal merge-K (follower)          | ~270 + 2500b = ~2770b                                |
-| Normal prepare-swap                | ~430b (includes 62b descriptor + issuer attestation) |
-| Normal freeze/confiscate           | ~260b                                                |
-| Normal redeem                      | ~250b                                                |
-| Frozen unfreeze/confiscate         | ~260b                                                |
-| SwapReady cancel                   | ~260b                                                |
-| SwapReady swap-exec                | ~230 + other_leg_prev_tx (~2500b) = ~2730b           |
-| Contract issue (N=4 Normal outs)   | ~450b                                                |
+| Path                                   | Approx. size                                           |
+| -------------------------------------- | ------------------------------------------------------ |
+| NormalBase transfer (1 output, change) | ~230b                                                  |
+| NormalBase split (4 outputs, change)   | ~380b                                                  |
+| NormalBase merge-2 (anchor)            | ~340 + 1 × 2500b = ~2840b                              |
+| NormalBase merge-4 (anchor)            | ~380 + 3 × 2500b = ~7880b                              |
+| NormalBase merge-K (follower)          | ~270 + 2500b = ~2770b                                  |
+| NormalBase prepare-swap-transition     | ~250b                                                  |
+| NormalSwapOnRamp complete-swap-prep    | ~400b (includes issuer sig + null-data reconstruction) |
+| NormalSwapOnRamp abort-swap-prep       | ~230b                                                  |
+| NormalBase freeze/confiscate           | ~260b                                                  |
+| NormalBase redeem                      | ~250b                                                  |
+| Frozen unfreeze/confiscate             | ~260b                                                  |
+| SwapReady cancel                       | ~260b                                                  |
+| SwapReady swap-exec                    | ~230 + other_leg_prev_tx (~2500b) = ~2730b             |
+| Contract issue (N=4 NormalBase outs)   | ~450b                                                  |
 
 **Merge-4 anchor unlocking ~8 KB.** Within BSV per-tx size limits; feasibility для pseudo-ASM ok. Followers ~2.8 KB each. Total merge-4 tx ~19 KB (see `BNTP_VS_DSTAS_COMPARISON.md` §2.5).
 
@@ -922,12 +1099,12 @@ Reference: `DSTAS_LOCKING_SCRIPT_AUDIT.md` и `BNTP_CRITICAL_REVIEW.md`. Клю�
 An attacker tries to produce an output that satisfies `output.WHITELIST == this.WHITELIST` but has a mutated PREFIX/SUFFIX. Fails because:
 
 - Step 7.2.6 computes `h_candidate` over PREFIX/SUFFIX (not whitelist).
-- `h_candidate` must match one of the 3 hashes in the embedded whitelist.
+- `h_candidate` must match one of the 4 hashes in the embedded whitelist.
 - Body mutation changes `h_candidate` → hash mismatch → reject.
 
 ### 13.2 Attack surface: body marker spoofing
 
-Attacker tries to craft an output with wrong body_marker to bypass template identification. Dispatch logic explicitly checks marker ∈ {0x01ff, 0xfeff, 0x0fff, 0xc0ff} and rejects otherwise. If marker doesn't match expected template for this path, reject.
+Attacker tries to craft an output with wrong body_marker to bypass template identification. Dispatch logic explicitly checks marker ∈ {0x01ff, 0x02ff, 0xfeff, 0x0fff, 0xc0ff} and rejects otherwise. Per-path output-marker restrictions (§7.2, §7.4) further narrow acceptable markers for each path's target.
 
 ### 13.3 New attack surface: SwapReady descriptor forgery
 
@@ -939,48 +1116,56 @@ SwapReady's swap descriptor is owner-set. An attacker-owner could craft a descri
 
 ## 14. Implementation phases
 
-### Phase 0 — Pre-impl gates (~2 weeks)
+### Phase 0 — Pre-impl gates (COMPLETED 2026-04-17)
 
-Before any template implementation, complete (see `BNTP_CRITICAL_REVIEW.md` §5):
+- [x] Pseudo-ASM all-paths Normal — ~4640b, exceeds 2400b budget → PIVOT
+- [x] Formal whitelist commitment write-up — PASS
+- [x] Anchor/follower position-check algorithm — PASS
 
-- [ ] Pseudo-ASM `Normal` template — confirm body size ≤ 2400b
-- [ ] Formal whitelist commitment write-up — prove scheme soundness
-- [ ] Anchor/follower position-check algorithm — concrete pseudo-code with rigor
-- [ ] Resolve open spec gaps (§15)
+**Outcome:** PIVOT to Option A (split Normal → NormalBase + NormalSwapOnRamp). See `BNTP_CRITICAL_REVIEW.md` §8 for Phase 0 outcome and `BNTP_ALTERNATIVES_RECOMMENDATION.md` for pivot justification.
 
-**Go/no-go:** proceed to Phase 1 only if Normal ≤ 2400b и commitment scheme formally sound. If Normal > 2600b → redesign. If commitment scheme has fundamental flaw → redesign.
+### Phase 0.1 — Option A adoption (IN PROGRESS 2026-04-18)
+
+- [x] Design AMR #1 issuer attestation redesign (null-data + SIGHASH_ALL)
+- [x] Spec pivot to 4-template Option A architecture
+- [x] Merge 11 Phase 0 SPEC AMENDMENT REQUESTs into spec
+- [ ] NormalBase pseudo-ASM to opcode depth (gate G4 ≤ 3000b target)
+- [ ] Gate G4 verdict
+
+**Go/no-go:** proceed to Phase 1 if NormalBase ≤ 3200b. If 3200-3400b → minor scope reduction. If > 3400b → ABORT Option A, revisit Option B.
 
 ### Phase 1 — PoC skeleton (mint + transfer + redeem)
 
 - `Contract` template, issue path only
-- `Normal` template, paths: transfer/split (path 1), merge-K (path 2), redeem (path 6)
-- Whitelist populated with `h_Normal` + 2 zero-slots (placeholders for Frozen, SwapReady)
+- `NormalBase` template, paths: transfer/split (path 1), merge-K (path 2), redeem (path 6)
+- Whitelist populated with `h_NormalBase` + 3 zero-slots (placeholders for NormalSwapOnRamp, Frozen, SwapReady)
 - `seriesId` = SHA256 of this partial whitelist (PoC-only value, not production)
 - Tail layout finalized (145b + optionalData)
 - SDK builders for 5 tx types: mint-contract, issue, transfer, split, merge-K, redeem
-- Conformance vectors для всех
+- Conformance vectors for all
 
 **Deliverable:** PoC token can be minted, transferred, split, merged (K ∈ [2, 4]), redeemed. No freeze, no swap. Demonstrates series commitment and closed forward state.
 
 ### Phase 2 — Freeze + Confiscation
 
 - Add `Frozen` template
-- Extend `Normal` with paths 4 (freeze), 5 (confiscate)
+- Extend `NormalBase` with paths 4 (freeze), 5 (confiscate)
 - Add paths 4, 5 in `Frozen`
-- Update whitelist: `h_Normal`, `h_Frozen`, 1 zero-slot
+- Update whitelist: `h_NormalBase`, `h_Frozen`, 2 zero-slots
 - Update seriesId
 - SDK builders for freeze, unfreeze, confiscate
 
 **Note:** Phase 1 tokens are NOT forward-compatible with Phase 2 whitelist (seriesId changes). Phase 1 is for skeleton validation only.
 
-### Phase 3 — SwapReady + Swap (with issuer attestation)
+### Phase 3 — SwapReady + Swap (with NormalSwapOnRamp two-step flow)
 
-- Add `SwapReady` template
-- Extend `Normal` with path 3 (prepare-swap with issuer attestation, Способ C)
-- SwapReady paths: 3 (cancel), 7 (swap-exec)
-- Update all templates' WHITELIST to final 3 hashes
+- Add `NormalSwapOnRamp` template (paths: abort, complete-swap-prep with issuer attestation)
+- Add `SwapReady` template (paths: cancel, swap-exec)
+- Extend `NormalBase` with path 3 (prepare-swap-transition → NormalSwapOnRamp)
+- Update all templates' WHITELIST to final 4 hashes (128b block)
 - **Final seriesId lock-in** at end of Phase 3
-- SDK builders for prepare-swap, swap-exec, cancel, issuer attestation service stub
+- SDK builders for prepare-swap-transition, complete-swap-prep, abort-swap-prep, swap-exec, cancel
+- Issuer attestation service reference implementation (null-data output generator + preimage signer)
 
 **Tokens minted in Phase 3 onwards are production BNTP v1.**
 
@@ -998,38 +1183,56 @@ Before any template implementation, complete (see `BNTP_CRITICAL_REVIEW.md` §5)
 
 ---
 
-## 15. Open questions (to be resolved during Phase 0)
+## 15. Resolved questions (Phase 0 + Phase 0.1)
 
-1. **Body marker encoding (§7.4):** Option A (2-byte tag with hardcoded values: 0x01ff Normal, 0xfeff Frozen, 0x0fff SwapReady, 0xc0ff Contract). Accepted.
-2. **issuerPkh derivation for tokenId:** explicit genesisTxId provided in issue unlocking (§9.10) vs signature-anchored derivation. Accepted: explicit for v1, revisit in v2.
-3. **Sighash type explicit check:** add `sighashType == 0x41 OP_EQUALVERIFY` in every template (+5b). **Accepted: YES**.
-4. **Anti-dust rule:** enforce `satoshis ≥ 1` on every token output (+4 opcodes per output check). **Accepted: YES**.
-5. **OptionalData size limit:** cap at 4096 bytes to avoid unlocking-size DoS. DSDK enforces on output creation. On-chain script does not enforce (size-independent). **Accepted.**
-6. **Cross-token swap optionalData semantics:** principal output for leg receives the OPPOSITE leg's optionalData (since principal holds other token). Remainder keeps own leg's optionalData. **Accepted in §4.2 rule 4.**
-7. **Issuer MPKH support:** add `isIssuerMpkh` flag bit 4 in authorityFlags. **Accepted, integrated in §5.5 and §8.4.**
-8. **Attestation TTL semantics:** timestamp advisory, script does not enforce freshness. SDK/indexer rejects stale SwapReady during discovery. **Accepted.**
-9. **Royalty minimum satoshis:** 1000 sats default, configurable by issuer at series deployment (embedded as constant in Normal template body). **TODO:** finalize exact encoding during pseudo-ASM — need deterministic-offset push in body.
-10. **Rate floor for SwapReady:** SDK rejects SwapReady creation where `rateDenom > input_satoshis` to prevent "unexecutable partial" traps. Not enforced on-chain. **Accepted.**
+1. ✅ **Body marker encoding (§7.4):** 2-byte tag — 0x01ff NormalBase, 0x02ff NormalSwapOnRamp, 0xfeff Frozen, 0x0fff SwapReady, 0xc0ff Contract.
+2. ✅ **issuerPkh derivation for tokenId:** explicit genesisTxId provided in issue unlocking (§9.10). Revisit in v2.
+3. ✅ **Sighash type explicit check:** `sighashType == 0x41 OP_EQUALVERIFY` in every template (+5b).
+4. ✅ **Anti-dust rule:** enforce `satoshis ≥ 1` on every token output (+4 opcodes per output).
+5. ✅ **OptionalData size limit:** SDK caps at 4096 bytes; on-chain script does not enforce (size-independent).
+6. ✅ **Cross-token swap optionalData semantics:** principal inherits opposite leg's optionalData; remainder keeps own.
+7. ✅ **Issuer MPKH support:** `isIssuerMpkh` flag bit 4 in authorityFlags (§5.5, §8.4).
+8. ✅ **Attestation TTL semantics:** timestamp advisory on-chain; SDK/indexer enforces freshness.
+9. ✅ **Issuer attestation mechanism (AMR #1):** null-data output at output index 1, covered by issuer's SIGHASH_ALL preimage signature. No CHECKSIG-over-arbitrary-hash required. See §9.4.2.
+10. ✅ **Unlocking pushes full candidate scripts (S1 AMR #2):** not tuple components. SDK builder derives script bytes from (owner, action_data, body, tail).
+11. ✅ **WHITELIST normative offset (S1 AMR #3):** immediately after PREFIX. See §5.3.1.
+12. ✅ **WHITELIST zero-placeholder never in hash (S2 AMR #1):** explicit in §5.3.
+13. ✅ **Raw-byte slices for h_candidate (S2 AMR #2):** explicit in §5.3.
+14. ✅ **Body marker set per-path (S2 AMR #3):** per-path output-marker restrictions in §7.2, §7.4.
+15. ✅ **Optional Contract seriesId sanity check (S2 AMR #4):** add ~40b check to Contract issue path. Accepted as optional hardening.
+16. ✅ **BNTP input contiguity invariant (S3 AMR #1):** normative in §9.3 — BNTP inputs at positions [0..K-1], funding at K.
+17. ✅ **all_outpoints / funding_outpoint separation (S3 AMR #2):** separate pushes in unlocking, hash over concatenation in order.
+18. ✅ **followerCount cross-check (S3 AMR #3):** anchor verifies `followerCount == (|all_outpoints|/36) - 1`.
+19. ✅ **BIP143 preimage offsets (S3 AMR #4):** TODO in `BNTP_INVARIANTS.md` when written.
+
+## 15a. Remaining open questions (Phase 0.2+)
+
+1. **Royalty minimum satoshis encoding:** 1000 sats default; finalize byte-encoding during NormalSwapOnRamp pseudo-ASM.
+2. **Rate floor for SwapReady:** SDK-level rejection of `rateDenom > input_satoshis` to prevent unexecutable-partial traps. Not on-chain.
+3. **OP_CODESEPARATOR optional optimization:** formal trace of interaction with OP_PUSH_TX scriptCode hashing. If safe, can share PREFIX code across templates (see alternatives evaluation candidate E).
+4. **Deferred to BNTP v2:** signature-anchored tokenId derivation (more rug-resistant than explicit genesisTxId).
 
 ---
 
 ## 16. Terminology index
 
-- **Anchor:** input[0] in merge-K, performs full conservation check for all K STAS inputs.
+- **Anchor:** input[0] in merge-K (NormalBase path 2), performs full conservation check for all K STAS inputs.
 - **Body:** opcode bytes between OP_2DROP and OP_RETURN.
-- **Body marker:** first 2 bytes of body, identifies template (0x01ff Normal, 0xfeff Frozen, 0x0fff SwapReady, 0xc0ff Contract).
+- **Body marker:** first 2 bytes of body, identifies template (0x01ff NormalBase, 0x02ff NormalSwapOnRamp, 0xfeff Frozen, 0x0fff SwapReady, 0xc0ff Contract).
 - **Counterparty script:** bytes after owner+action_data push, common to all UTXOs of same token+state.
-- **Follower:** input[1..K-1] in merge-K, performs lightweight check delegating to anchor.
+- **Follower:** input[1..K-1] in merge-K (NormalBase path 2), performs lightweight check delegating to anchor.
 - **h_X:** SHA256 shape hash of template X (excludes whitelist block).
-- **Issuer attestation:** signature from `issuerPkh` over `(tokenId ‖ outpoint ‖ timestamp)` required on prepare-swap path.
+- **Issuer attestation:** mandatory null-data output at output index 1 in complete-swap-prep tx, covered by issuer's SIGHASH_ALL signature over preimage. Carries (tokenId, outpoint, timestamp, issuerPubkey). See §9.4.2.
 - **MPKH:** Multi-Pubkey Key Hash, canonical m-of-n preimage.
+- **NormalBase:** principal Normal-category template. Paths 1, 2, 4, 5, 6 and prepare-swap-transition (path 3).
+- **NormalSwapOnRamp:** ephemeral Normal-category template entered via NormalBase path 3. Holds complete-swap-prep (path 3, with issuer attestation) and abort-swap-prep (path 1).
 - **Path_id:** small integer (1..8) in unlocking selecting the spend path within a template.
 - **Preimage:** sighash preimage per BIP143/BSV covenant, accessed via OP_PUSH_TX.
 - **requestedScriptHash:** in swap descriptor, SHA256 of counterparty's counterparty-script tail.
-- **seriesId:** SHA256(WHITELIST), commits to the 3 body hashes in the series.
-- **Tail:** fixed-layout fields after OP_RETURN.
+- **seriesId:** SHA256(WHITELIST), commits to the 4 body hashes in the series.
+- **Tail:** fixed-layout 145-byte fields after OP_RETURN.
 - **tokenId:** per-issuance unique identifier, SHA256(genesisTxId ‖ contractVout ‖ issuerPkh).
-- **WHITELIST:** 96-byte constant block embedded in every template body; contains 3 body hashes.
+- **WHITELIST:** 128-byte constant block embedded in every template body at fixed offset after PREFIX; contains 4 body hashes (`h_NormalBase ‖ h_NormalSwapOnRamp ‖ h_Frozen ‖ h_SwapReady`).
 
 ---
 
@@ -1038,3 +1241,4 @@ Before any template implementation, complete (see `BNTP_CRITICAL_REVIEW.md` §5)
 - **2026-04-17** — initial draft, Series v1 with 5 templates (Normal-2/4/8, Frozen, SwapReady).
 - **2026-04-17** — updated: single-variant Normal (dropped Normal-2 and Normal-8), whitelist 96b (3 hashes), DSTAS isolation rules. Decision rationale in §3.2. Audit time revised −40%.
 - **2026-04-17** — updated: added issuer attestation (Способ C) on prepare-swap path (§9.4). Added `isIssuerMpkh` authority flag (§5.5). Added royalty output requirement. Simplified Phase 4 into audit/ship phase (merged with former Phase 5). Moved Phase 0 gates to explicit pre-impl checks.
+- **2026-04-18** — **Phase 0.1 structural pivot to Option A.** Split `Normal` template into `NormalBase` (paths 1, 2, 4, 5, 6) + `NormalSwapOnRamp` (path 3 only). Whitelist expanded from 3 to 4 templates (128b block). Issuer attestation mechanism redesigned per AMR #1: null-data output covered by SIGHASH_ALL preimage, replacing CHECKSIG-over-arbitrary-hash pattern (~100b savings). Prepare-swap is now a two-step flow: (a) NormalBase path 3 (prepare-swap-transition, owner-only, produces NormalSwapOnRamp), (b) NormalSwapOnRamp path 3 (complete-swap-prep, owner + issuer attestation + royalty, produces SwapReady). Added NormalSwapOnRamp abort path (path 1). All 11 Phase 0 SPEC AMENDMENT REQUESTs applied. NormalBase body target revised to ≤ 3000b (G4 gate). See `BNTP_CRITICAL_REVIEW.md` §8 for outcome history.

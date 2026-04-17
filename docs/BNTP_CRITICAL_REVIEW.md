@@ -277,6 +277,7 @@ Pivot если:
 ## 8. Revision history
 
 - **2026-04-17** — initial critical review. Accepted decisions: single-variant Normal, Способ C issuer attestation. Raised open spec gaps (§4). Defined Phase 0 gates (§5).
+- **2026-04-18** — **Alternatives research phase complete.** Single sonnet agent evaluated 8 architectural alternatives (`BNTP_ALTERNATIVES_EVALUATION.md`). Synthesis in `BNTP_ALTERNATIVES_RECOMMENDATION.md`. **Option A confirmed as winner (33/35 vs next-best 31/35).** Key finding: cross-input introspection gap in BSV Script structurally blocks 3 out of 7 alternatives (Action UTXO, Two-UTXO split, Intent+Execute). This is a protocol-level constraint, not a design oversight. Cost: ~$0.30 sonnet (vs original $14-16 opus estimate). Phase 0.1 cleared to proceed: (1) resolve S1 AMR #1 issuer attestation redesign, (2) merge remaining 10 SPEC AMRs, (3) pseudo-ASM NormalBase to opcode depth, (4) optional OP_CODESEPARATOR investigation.
 - **2026-04-17** — **Phase 0 executed** via wave package `docs/stream-tasks/bntp-phase-0-pseudo-asm-wave/`. Three parallel opus agents (S1 Normal pseudo-ASM, S2 whitelist proof, S3 anchor/follower algorithm). Results:
   - G1 (Normal body ≤ 2400b): **PIVOT** — actual ~4640b, optimized floor ~3600b. Budget was unrealistic.
   - G2 (whitelist soundness): **PASS** — 5/5 claims defended, 11 new surfaces enumerated 0 unmitigated, scheme formally sound (constant-function argument).

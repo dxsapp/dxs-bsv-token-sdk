@@ -84,7 +84,6 @@ export const H_NORMAL_PLACEHOLDER_HEX =
 // normal-body.ts §3.2 for detailed commentary. Byte-identical to Normal's
 // `COVENANT_S_PREAMBLE_ASM` + `COVENANT_TAIL_ASM`.
 
-
 // ---------------------------------------------------------------------------
 // §3.3 Sighash-type check (duplicated from normal-body.ts)
 // ---------------------------------------------------------------------------

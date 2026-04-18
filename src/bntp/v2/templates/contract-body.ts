@@ -27,11 +27,6 @@ import {
 //   - TAIL_CACHE_ASM           (§3.5 tail cache        — 159b)
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
 /**
  * BNTP v2 Contract template body ASM — Phase 1 A.3 scope.
  *

@@ -915,6 +915,22 @@ These rules are not enforced on-chain; they are normative for wallet vendors and
 
 Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 
+### Phase 1 sub-structure (elaborated post-A.3)
+
+Phase 1 is internally divided:
+
+- **Phase 1A — real ASM template bodies.**
+  - 1A.1 Normal template: **DONE (2620b PIVOT)** per A.1.1 + A.2 + A.2.5 + A.3 arc. See `BNTP_V2_NORMAL_TEMPLATE_A3_REPORT.md` for final measurements.
+  - 1A.3 Contract + Frozen templates: **not yet written.** Similar pipeline (audit → write → measure → adversarial review) to 1A.1. Contract body projected ~3100b (inlines Normal per §5.5.2). Frozen body projected ~700b.
+- **Phase 1B — SDK + execution verification.** Builders, issuer service, stack-correctness verification, conformance vectors. Known deliverables include:
+  - **Fix A.3.1 (pre-existing A.1.1 bug):** `OP_1 OP_5 OP_WITHIN` in MPKH range check currently rejects legitimate `m = 5` (WITHIN is semi-open `[low, high)`). Change to `OP_1 OP_6 OP_WITHIN` or equivalent to admit `m ∈ {1..5}`. ~0b body impact.
+  - **Fix A.3.2 (MPKH owner output support):** A.1.1 ASM hardcodes `14 OP_SPLIT` (20-byte extract) for owner parsing in output reconstruction, forcing PKH-only output owners. A.3's Moderate #5 size check makes this limitation explicit (fails `OP_VERIFY` on 35-171b MPKH owner pushes). Phase 1B MUST implement variable-length owner extraction so that spec decision #3 ("Owner PKH/MPKH — Both supported") holds for outputs as well as inputs. Estimated body cost: +50-100b (per-output branch on flag bit 5 driving owner-slice length). May push total body into 2700-2720b — either accept PIVOT to that range, or optimize elsewhere (e.g., apply DSTAS §5.1.A/B preimage parse opts for −30-50b), or amend G5 gate to ≤ 2800b.
+  - Stack-arithmetic execution verification on full 2620b Normal body + forthcoming Contract + Frozen bodies. Load-bearing for semantic correctness claim.
+  - Unlocking script builders for all 4 Normal paths + Contract issue + Frozen unfreeze/confiscate.
+  - Reference issuer service stub (off-chain preimage signer for refresh + issue).
+  - Conformance vectors for every spend path.
+  - Fix jest/ts-jest version mismatch so `npm test` runs unblocked.
+
 ### Phase 2 — Authority paths
 
 - Add Frozen template
@@ -1015,6 +1031,9 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 - **2026-04-18** — Initial draft of BNTP v2. Pivot from v1 after full-tx footprint analysis showed v1 did not strictly dominate DSTAS. v2 redefines success as "solve STAS pains" not "smaller footprint". Swaps external, amount-in-tail, issuer attestation via depth-based rolling model. 12 design questions resolved with user input (see §15).
 - **2026-04-18** — Pseudo-ASM validation (opus) measured Normal body at **2461b** — low in PIVOT band vs initial ≤2000b target. Pain-resolution analysis (sonnet) scored BNTP v2 at 61/105 vs DSTAS 26.5/105 weighted (merge + B2G dominate, adoption friction -1). User ratified 8 additional design decisions + 3 SPEC AMENDMENT REQUESTs resolving pseudo-ASM OPEN QUESTIONs. Spec updated: §5.5 body hash manifest (replaces whitelist commitment), §9.2.1 max_input_depth collective enforcement, §9.3 MPKH issuer royalty owner, §9.6 redeem as flex-transfer (no dedicated path), §9.9.1 Contract tail with amount field, §9.11 uint128-vs-ScriptNum runtime cap, §11.1 G5 gate revised to ≤2500b. Verdict: **PASS under revised gate**. Proceed to Phase 1 planning.
 - **2026-04-18** — Security / workflow review closed 6 spec gaps (decisions #21-#26, §15): depth overflow saturation (§9.2), `amounts_in_array` length derived from outpoints count (§9.2), input-layout contiguity rule BNTP inputs [0..N-1] + funding at N (§9.2), null-data canonical direct-push-minimal encoding (§7.2.1), max flex-transfer fan-in `N ≤ 32` (§9.2), and SDK deploy-time template hash verification tool as Phase 1 deliverable (§14). On-chain body impact: ~+35b added via extra checks → estimated Normal body ≈ **2496b**, still PASS under revised G5 gate (≤ 2500b) — edge case, exactly at boundary. Gap 4 is a **decrease** of ~3b per null-data tx (direct push < PUSHDATA1).
+- **2026-04-18** — **Phase 1A Normal template arc closed (A.1.1 → A.2 → A.2.5 → Step C → A.3).** Full measurement trajectory: 1901 (A.1.1, path 1 only) → 2587 (A.2, paths 2-4 added) → 2574 (A.2.5, MPKH issuer + change + retro-opt) → 2620 (A.3, Step C fixes). Final verdict: **PIVOT 2620b** (80b under ABORT). Two new findings surfaced in A.3 deferred to Phase 1B per user decision:
+  - **A.3.1:** pre-existing A.1.1 bug — `OP_1 OP_5 OP_WITHIN` (semi-open `[1,5)`) rejects legitimate `m = 5`. Phase 1B fixes via range widen.
+  - **A.3.2:** MPKH owner output not supported by A.1.1 ASM (`14 OP_SPLIT` hardcodes 20-byte owner slice). Step C Moderate #5 size check made the gap explicit. Phase 1B implements variable-length owner extraction; spec decision #3 (Owner PKH/MPKH — Both supported) remains normative target, just not delivered in Phase 1A. Est. +50-100b body; may force G5 amendment to ≤ 2800b.
 - **2026-04-18** — **Step C adversarial spec review** (`BNTP_V2_SPEC_ADVERSARIAL_REVIEW.md`, delegated opus agent): SHIP-WITH-FIXES verdict, 1 critical + 6 moderate + 5 minor findings. 22 attack surfaces probed clean (conservation, tokenId enforcement, attestation binding, cross-template SHA-256 PRS, depth saturation, FORKID replay, tokenId collision, output-count bounds, N≤32, contiguity, anti-dust). User ratified all findings; all applied (decisions #39-#47, §15):
   - **#39 Critical:** confiscate preserves depth (was: reset to 0). Closes confiscAuth-compromise silent-forgery surface. ~0b body.
   - **#40:** stale "redeem allows burn" in §4.2 rule 11 purged.

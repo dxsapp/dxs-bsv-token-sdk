@@ -844,6 +844,7 @@ export const NORMAL_BODY_SIZE: number = NORMAL_BODY_BYTES.length;
  */
 export const NORMAL_BODY_SECTION_SIZES = {
   bodyMarker: BODY_MARKER_BYTES.length,
+  covenantPreimageRoll: asmToBytes(COVENANT_PREIMAGE_ROLL_ASM).length,
   covenantPreamble: asmToBytes(COVENANT_S_PREAMBLE_ASM).length,
   covenantTail: asmToBytes(COVENANT_TAIL_ASM).length,
   sighashCheck: asmToBytes(SIGHASH_CHECK_ASM).length,

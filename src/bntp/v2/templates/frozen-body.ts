@@ -318,6 +318,7 @@ export const FROZEN_BODY_SIZE: number = FROZEN_BODY_BYTES.length;
  * isolation; the sum equals FROZEN_BODY_BYTES.length.
  */
 export const FROZEN_BODY_SECTION_SIZES = {
+  covenantPreimageRoll: asmToBytes(COVENANT_PREIMAGE_ROLL_ASM).length,
   bodyMarker: BODY_MARKER_BYTES.length,
   covenantPreamble: asmToBytes(COVENANT_S_PREAMBLE_ASM).length,
   covenantTail: asmToBytes(COVENANT_TAIL_ASM).length,

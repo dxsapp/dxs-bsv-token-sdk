@@ -87,10 +87,12 @@ describe("BNTP v2 Contract template — body size (A.3)", () => {
     expect(sum).toBe(CONTRACT_BODY_SIZE);
   });
 
-  test("inlinedNormalBody section is ≥ 2620b (full Normal body + push overhead)", () => {
+  test("inlinedNormalBody section >= NORMAL_BODY_BYTES.length (full body + push overhead)", () => {
+    // Dynamic floor — reflects current Normal body size. Protects against
+    // accidental drop of Normal body inline (would regress to ~32b placeholder).
     expect(
       CONTRACT_BODY_SECTION_SIZES.inlinedNormalBody,
-    ).toBeGreaterThanOrEqual(2620);
+    ).toBeGreaterThanOrEqual(NORMAL_BODY_BYTES.length);
   });
 
   test("informational: Contract body size + section breakdown + verdict", () => {

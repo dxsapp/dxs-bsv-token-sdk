@@ -32,6 +32,7 @@ import {
 } from "../src/script";
 import { PrivateKey } from "../src/bitcoin/private-key";
 import { toHex } from "../src/bytes";
+import { NORMAL_BODY_SIZE } from "../src/bntp/v2/templates/normal-body";
 
 const TEST_PRIVATE_KEY_HEX =
   "0000000000000000000000000000000000000000000000000000000000000042";
@@ -78,14 +79,16 @@ const buildScenario = (): FlexTransferScenario => {
 };
 
 describe("BNTP v2 Normal template — flex-transfer execution (Phase 1B Wave C)", () => {
-  test("constructed locking script is 2755b per spec §11.2 / task spec", () => {
+  test("constructed locking script length matches spec §11.2 structure", () => {
     const scenario = buildScenario();
     const a = assembleFlexTransferScenario(scenario);
 
-    // 21 (owner push) + 1 (OP_0) + 1 (OP_2DROP) + 2620 (body) + 1 (OP_RETURN)
-    // + 111 (tail, optionalData empty) = 2755
-    expect(a.inputLockingScript.length).toBe(2755);
-    expect(a.outputLockingScript.length).toBe(2755);
+    // 21 (owner push) + 1 (OP_0) + 1 (OP_2DROP) + NORMAL_BODY_SIZE (body)
+    // + 1 (OP_RETURN) + 111 (tail, optionalData empty)
+    // NORMAL_BODY_SIZE changes as Wave C.x fixes land; derive dynamically.
+    const expected = 23 + NORMAL_BODY_SIZE + 1 + 111;
+    expect(a.inputLockingScript.length).toBe(expected);
+    expect(a.outputLockingScript.length).toBe(expected);
   });
 
   test("sanity: pushed preimage's hash matches what a same-scriptCode CHECKSIG would hash", () => {
@@ -136,7 +139,7 @@ describe("BNTP v2 Normal template — flex-transfer execution (Phase 1B Wave C)"
     // Here, assert that our pushed preimage is well-formed for the owner key:
     // sign it, verify it. If this fails, our preimage isn't what we think.
     expect(scenario.ownerKey.verify(sig, hash256(a.preimage))).toBe(true);
-     
+
     console.log(
       "[Wave C] pushed preimage length:",
       a.preimage.length,
@@ -206,7 +209,7 @@ describe("BNTP v2 Normal template — flex-transfer execution (Phase 1B Wave C)"
         strict: false,
       },
     );
-     
+
     console.log(
       "[Wave C] P2PK sanity:",
       JSON.stringify({ success: result.success, error: result.error }),
@@ -265,7 +268,7 @@ describe("BNTP v2 Normal template — flex-transfer execution (Phase 1B Wave C)"
             ? `${step.stackTopHex.slice(0, 32)}…`
             : step.stackTopHex,
       }));
-     
+
     console.log(
       "[Wave C] first 10 locking steps:",
       JSON.stringify(firstLockingSteps, null, 2),
@@ -294,7 +297,7 @@ describe("BNTP v2 Normal template — flex-transfer execution (Phase 1B Wave C)"
     }));
 
     // Print structured diagnostics to the jest output.
-     
+
     console.log(
       "[Wave C] Result:",
       JSON.stringify(

@@ -110,59 +110,51 @@ export const SIGHASH_CHECK_ASM = `
   41000000 OP_EQUALVERIFY
 `;
 
-// §3.4 preimage parse (unoptimized DSTAS pattern).
+// §3.4 preimage parse (Phase 1B Wave C.3 rewrite).
+//
+// Pre-condition: main stack top = preimage (preserved by SIGHASH_CHECK).
+// Post-condition: main stack — preimage consumed; altstack (top-down):
+//   [scriptCode, hashOutputs, thisOutpoint, hashPrevouts]
+// i.e. scriptCode on top — ready for TAIL_CACHE_ASM to FROMALTSTACK directly.
+//
+// Fixes vs prior agent-generated version:
+//   (1) Varint dispatcher was written as push-opcode dispatcher
+//       (0x4b/0x4c/0x4d/0x4e). The preimage scriptCodeLen is a Bitcoin
+//       VARINT (0x00-0xFC direct, 0xFD+2b LE, 0xFE+4b LE, 0xFF+8b LE). This
+//       rewrite uses the correct varint encoding, assuming scriptCode ∈
+//       [253, 65535] bytes (always 0xFD marker for current BNTP v2
+//       templates: Normal 2622b, Contract 3973b, Frozen 1284b). A future
+//       oversized template would require widening to 0xFE case.
+//   (2) Prior version's end-cleanup dropped scriptCode + hashOutputs +
+//       outpoint from altstack, leaving only hashPrevouts — contradicting
+//       the block's own docstring. This rewrite preserves all 4 and
+//       reorders so scriptCode ends on alt top for downstream TAIL_CACHE.
+//
+// BIP143 preimage layout (what this block walks):
+//   4b  nVersion        → discarded
+//   32b hashPrevouts    → cached
+//   32b hashSequence    → discarded
+//   36b outpoint        → cached
+//   varint scriptCodeLen (0xFD + 2b LE for our templates)
+//   N b scriptCode      → cached
+//   8b  nValue          → discarded (via 12-byte combined skip with nSeq)
+//   4b  nSequence       → discarded
+//   32b hashOutputs     → cached
+//   4b  nLocktime       → discarded
+//   4b  sighashType     → verified == 0x41000000 (SIGHASH_ALL | FORKID)
 export const PREIMAGE_PARSE_ASM = `
-  OP_DUP
-  OP_4 OP_SPLIT
-  OP_SWAP OP_DROP
-  20 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  20 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  24 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  OP_1 OP_SPLIT
-  OP_OVER
-  00 OP_CAT OP_BIN2NUM
-  OP_DUP 4b OP_LESSTHANOREQUAL
-  OP_IF
-    OP_NIP
-  OP_ELSE
-    OP_DUP 4c OP_NUMEQUAL
-    OP_IF
-      OP_DROP OP_DROP
-      OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
-    OP_ELSE
-      OP_DUP 4d OP_NUMEQUAL
-      OP_IF
-        OP_DROP OP_DROP
-        OP_2 OP_SPLIT OP_SWAP 0000 OP_CAT OP_BIN2NUM
-      OP_ELSE
-        4e OP_NUMEQUALVERIFY
-        OP_DROP
-        OP_4 OP_SPLIT OP_SWAP OP_BIN2NUM
-      OP_ENDIF
-    OP_ENDIF
-  OP_ENDIF
-  OP_DUP OP_TOALTSTACK
-  OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  OP_FROMALTSTACK OP_DROP
-  OP_8 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  OP_4 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  20 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  OP_4 OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  OP_DUP OP_SIZE OP_NIP OP_4 OP_NUMEQUALVERIFY
+  OP_4 OP_SPLIT OP_NIP
+  20 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  20 OP_SPLIT OP_NIP
+  24 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  OP_1 OP_SPLIT OP_SWAP FD OP_EQUALVERIFY
+  OP_2 OP_SPLIT OP_SWAP 0000 OP_CAT OP_BIN2NUM
+  OP_SPLIT OP_SWAP OP_TOALTSTACK
+  0c OP_SPLIT OP_NIP
+  20 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  04 OP_SPLIT OP_NIP
   41000000 OP_EQUALVERIFY
-  OP_FROMALTSTACK OP_DROP
-  OP_FROMALTSTACK OP_DROP
-  OP_FROMALTSTACK OP_TOALTSTACK
-  OP_FROMALTSTACK OP_DROP
-  OP_FROMALTSTACK OP_TOALTSTACK
+  OP_FROMALTSTACK OP_FROMALTSTACK OP_SWAP OP_TOALTSTACK OP_TOALTSTACK
 `;
 
 // §3.5 scriptCode tail extraction + cache (7 fields to altstack).

@@ -360,6 +360,7 @@ export const CONTRACT_BODY_SIZE: number = CONTRACT_BODY_BYTES.length;
  * (the whole PATH6_INLINE_NORMAL_BODY_ASM block).
  */
 export const CONTRACT_BODY_SECTION_SIZES = {
+  covenantPreimageRoll: asmToBytes(COVENANT_PREIMAGE_ROLL_ASM).length,
   bodyMarker: BODY_MARKER_BYTES.length,
   covenantPreamble: asmToBytes(COVENANT_S_PREAMBLE_ASM).length,
   covenantTail: asmToBytes(COVENANT_TAIL_ASM).length,

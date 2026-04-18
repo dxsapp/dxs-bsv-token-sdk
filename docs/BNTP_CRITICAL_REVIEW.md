@@ -305,6 +305,46 @@ Pivot если:
   - **Revised body projection:** Normal 2496b → **~2550-2600b (upper PASS / edge PIVOT)**. If A.1.1 real-ASM measure exceeds 2600b, G5 lift to ≤ 2700b is next fallback. Per-UTXO vs DSTAS: Normal −12% (was −15%), Frozen −73% unchanged. Unlocking sizes grow meaningfully for freeze (+700b) and unfreeze (+2500b) but stay small for common transfer paths.
   - **Audit ROI confirmed:** ~1.5h audit found 3 spec gaps that would have cost 8-16h real-ASM rework. Split A.1 → A.1.0/A.1.1 validated empirically.
   - **Next:** A.1.1 real BSV Script ASM writing for PREFIX + flex-transfer, measure vs ≤2600b gate. Proceed upon spec commit.
+- **2026-04-18** — **Phase 1A Normal template arc COMPLETE** (session wrap-up). Full trajectory from design-frozen spec to adversarial-review-fixed real BSV Script ASM artifact:
+
+  **Commits (this session, chronological):**
+  - `274f5b0` — A.1.1: real ASM PREFIX + path 1 flex-transfer, **1901b PASS**
+  - `24a0fab` — A.2: paths 2/3/4, **2587b PASS** (13b margin)
+  - `f8f9075` — 4 A.2 spec gap closures (decisions #34-#38)
+  - `829546a` — A.2.5: MPKH issuer + optional change + retro FD-varint, **2574b PASS** (26b margin, feature-complete)
+  - `f34a7e7` — DSTAS PKH owner-auth security finding filed for separate investigation
+  - `c854108` — Step C adversarial spec review + 9 decision closures (#39-#47)
+  - `465b6a3` — A.3 Step C code fixes applied, **2620b PIVOT** (80b under ABORT)
+  - `89c57ca` — Phase 1B deferrals for A.3.1 + A.3.2 + elaborated §14 Phase 1 sub-structure
+
+  **State at session close:**
+  - Spec: **FROZEN, 47 ratified decisions, adversarially reviewed.** Located at `docs/BNTP_V2_SPEC.md`.
+  - Normal template real ASM: `src/bntp/v2/templates/normal-body.ts` — **2620b PIVOT** (verdict acceptable per Step C disposition). Covers all 4 spend paths (flex-transfer, refresh, freeze, confiscate) with MPKH owner + issuer + authorities, uint128 amount, depth counter, optional change output.
+  - Tests: `tests/bntp-v2-normal-template-size.test.ts`. jest blocked by pre-existing ts-jest/jest version mismatch; runs via `npx tsx` (9-11 assertions pass).
+  - Arc documentation: `docs/BNTP_V2_NORMAL_TEMPLATE_{AUDIT,A1_1_REPORT,A2_REPORT,A2_5_REPORT,A3_REPORT}.md`. A3 is the final consolidated report.
+  - Security reviews: `docs/BNTP_V2_SPEC_ADVERSARIAL_REVIEW.md` (Step C, SHIP-WITH-FIXES); `docs/DSTAS_PKH_OWNER_AUTH_FINDING.md` (separate investigation, repro pending).
+
+  **Known open items (ratified as deferred per user):**
+  - **A.3.1** (Phase 1B): fix `OP_1 OP_5 OP_WITHIN` MPKH range check — currently rejects legitimate m=5. Change to `OP_1 OP_6 OP_WITHIN`. ~0b body.
+  - **A.3.2** (Phase 1B): implement MPKH owner output support. A.1.1 ASM hardcodes 20-byte owner extract (`14 OP_SPLIT`); Step C fix #43 made the PKH-only limitation explicit. Est. +50-100b body; may force G5 amendment to ≤2800b or require optimization offset.
+  - **DSTAS finding** (separate investigation): empirical reproduction of PKH-owner-auth bypass hypothesis. Not blocking BNTP v2.
+  - **Stack-arithmetic execution verification** (Phase 1B): Normal body (2620b) has not been executed on a node. Byte-budget measured, semantic correctness TBD.
+  - **Contract + Frozen templates** (Phase 1A.3, next session): spec-only currently; need real ASM pass similar to Normal arc. Body projections: Contract ~3100b (inlines Normal body), Frozen ~700b.
+
+  **Process observations for next session (apply $research-and-design-discipline):**
+  - **A.1.0 audit ROI** empirically confirmed — ~1.5h audit + gap closure saved ~8-16h of real-ASM rework. Applied same split for Step C (review → spec amend → code apply) with similar ROI.
+  - **Agent projection accuracy improving:** A.2 projection 2711-2821b vs actual 2587b (−130-230b better than projected — agent overestimated); A.2.5 projection 2572b vs actual 2574b (+2b — excellent); A.3 projection 2619b vs actual 2620b (+1b — excellent). Model: later agent rounds calibrate better because priors are measured.
+  - **Spec hygiene lesson:** Step C found 3 of 6 moderate findings were "stale text not purged after ratification." Pattern: decision ratified, spec rule elsewhere not updated. Next session should do cross-reference purge pass before any new rounds.
+  - **Honest PIVOT > forced PASS:** ended at 2620b PIVOT after adversarial-review fixes. Could have optimized back to PASS (e.g., FD-varint applied more aggressively, preimage-parse DSTAS optimizations), but deferred to Phase 1B — both for time-budget reasons and to avoid muddying the verdict with optimization offsets. The PIVOT band exists specifically for this case.
+  - **DSTAS finding via external probe:** A.1.1 agent, tasked with writing ASM, incidentally discovered that DSTAS may have a dormant PKH owner-auth vulnerability. This is valuable "side information" from having a capable agent look at donor code adversarially. Not planned; appreciate when it happens.
+
+  **Next session pickup:**
+  - **Entry point:** `docs/BNTP_V2_SPEC.md` (the spec) + this document (`BNTP_CRITICAL_REVIEW.md` §8) + `docs/BNTP_V2_NORMAL_TEMPLATE_A3_REPORT.md` (consolidated Normal arc report).
+  - **Immediate next task:** Phase 1A.3 — Contract + Frozen templates via similar A-series pipeline (audit pseudo-spec → write real ASM → measure → adversarial review).
+  - **Recommend parallel dispatch** of Contract + Frozen agents (they touch different files, no conflict).
+  - **After Phase 1A.3:** Phase 1B (SDK builders, issuer service, execution verification, A.3.1 + A.3.2 fixes, jest fix).
+  - **Overall protocol status at session close:** design complete + Normal template byte-verified. Contract/Frozen byte-verification pending. NO execution verification yet, NO SDK yet. Still on track vs original "pivot to pain-resolution" goal.
+
 - **2026-04-17** — **Phase 0 executed** via wave package `docs/stream-tasks/bntp-phase-0-pseudo-asm-wave/`. Three parallel opus agents (S1 Normal pseudo-ASM, S2 whitelist proof, S3 anchor/follower algorithm). Results:
   - G1 (Normal body ≤ 2400b): **PIVOT** — actual ~4640b, optimized floor ~3600b. Budget was unrealistic.
   - G2 (whitelist soundness): **PASS** — 5/5 claims defended, 11 new surfaces enumerated 0 unmitigated, scheme formally sound (constant-function argument).

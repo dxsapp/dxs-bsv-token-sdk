@@ -1,6 +1,7 @@
 import { asmToBytes } from "../../../script/build/asm-template-builder";
 
 import {
+  COVENANT_PREIMAGE_ROLL_ASM,
   COVENANT_S_PREAMBLE_ASM,
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
@@ -285,6 +286,7 @@ export const PATH4_CONFISC_FROM_FROZEN_ASM_EXPORT =
 // Assemble FROZEN_BODY_ASM
 // ---------------------------------------------------------------------------
 export const FROZEN_BODY_ASM = `
+  ${COVENANT_PREIMAGE_ROLL_ASM}
   ${COVENANT_S_PREAMBLE_ASM}
   ${COVENANT_TAIL_ASM}
   ${SIGHASH_CHECK_ASM}

@@ -28,6 +28,24 @@
 // ---------------------------------------------------------------------------
 // §3.2 OP_PUSH_TX covenant preamble (ported from DSTAS donor)
 // ---------------------------------------------------------------------------
+// Pre-covenant stack fix (Phase 1B Wave C.1, resolves execution bug found
+// by Wave C verification): per spec §9.1 common unlocking layout, the
+// unlocking pushes `... preimage, path_id, sig, pubkey` with pubkey on top.
+// The covenant's OP_HASH256 needs the preimage on top of the main stack.
+// `OP_3 OP_ROLL` brings the preimage (at depth 3: under pubkey, sig,
+// path_id) to the top. `OP_DUP` duplicates it so that OP_HASH256 consumes
+// one copy while the other remains on stack for the downstream
+// SIGHASH_CHECK_ASM and PREIMAGE_PARSE_ASM blocks, both of which also
+// expect the preimage on top. Cost: +3b on every template's PREFIX.
+//
+// Without this shim, OP_HASH256 hashes the owner_pubkey byte string and
+// the covenant builds a sig for the wrong hash domain — CHECKSIGVERIFY
+// at the covenant tail rejects. See `docs/BNTP_V2_EXECUTION_VERIFICATION_REPORT.md`
+// for the full trace from Wave C.
+export const COVENANT_PREIMAGE_ROLL_ASM = `
+  OP_3 OP_ROLL OP_DUP
+`;
+
 // Computes `s` component of the DER signature from HASH256(preimage) via
 // modular arithmetic against N/2 constant. Preamble is byte-identical across
 // all 3 templates (no template-specific logic). Leaves stack in state
@@ -78,8 +96,17 @@ export const COVENANT_TAIL_ASM = `
 `;
 
 // §3.3 sighash-type check: 0x41 (SIGHASH_ALL | SIGHASH_FORKID).
+// Phase 1B Wave C.2 fix: removed spurious `OP_NIP` after `OP_SIZE`. The old
+// sequence `OP_DUP OP_SIZE OP_NIP OP_4 OP_SUB OP_SPLIT OP_NIP` consumed the
+// preimage's duplicate prematurely, making the subsequent OP_SPLIT consume
+// the original preimage — leaving no preimage on top for downstream
+// PREIMAGE_PARSE_ASM. Correct sequence preserves preimage:
+//   [preimage] → DUP → [p, p] → SIZE → [p, p, size] → 4 SUB → [p, p, size-4]
+//   → SPLIT → [p, left, right] → NIP → [p, right]
+//   → push 41000000 → [p, right, lit] → EQUALVERIFY → [p]
+// Net: preimage preserved on top for PREIMAGE_PARSE_ASM. Body size −1b.
 export const SIGHASH_CHECK_ASM = `
-  OP_DUP OP_SIZE OP_NIP OP_4 OP_SUB OP_SPLIT OP_NIP
+  OP_DUP OP_SIZE OP_4 OP_SUB OP_SPLIT OP_NIP
   41000000 OP_EQUALVERIFY
 `;
 

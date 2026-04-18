@@ -3,6 +3,7 @@ import { asmToBytes } from "../../../script/build/asm-template-builder";
 import { NORMAL_BODY_BYTES } from "./normal-body";
 
 import {
+  COVENANT_PREIMAGE_ROLL_ASM,
   COVENANT_S_PREAMBLE_ASM,
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
@@ -326,6 +327,7 @@ const PATH6_ISSUE_ASM = `
 // Assemble CONTRACT_BODY_ASM
 // ---------------------------------------------------------------------------
 export const CONTRACT_BODY_ASM = `
+  ${COVENANT_PREIMAGE_ROLL_ASM}
   ${COVENANT_S_PREAMBLE_ASM}
   ${COVENANT_TAIL_ASM}
   ${SIGHASH_CHECK_ASM}

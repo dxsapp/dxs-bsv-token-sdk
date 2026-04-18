@@ -1,5 +1,6 @@
 import { asmToBytes } from "../../../script/build/asm-template-builder";
 import {
+  COVENANT_PREIMAGE_ROLL_ASM,
   COVENANT_S_PREAMBLE_ASM,
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
@@ -800,6 +801,7 @@ const DISPATCHER_MIDDLE_ASM = `
 // Assemble NORMAL_BODY_ASM
 // ---------------------------------------------------------------------------
 export const NORMAL_BODY_ASM = `
+  ${COVENANT_PREIMAGE_ROLL_ASM}
   ${COVENANT_S_PREAMBLE_ASM}
   ${COVENANT_TAIL_ASM}
   ${SIGHASH_CHECK_ASM}

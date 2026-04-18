@@ -330,6 +330,7 @@ const OWNER_IDENTITY_ASM = `
     OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
     OP_TOALTSTACK
     OP_SIZE OP_1SUB OP_SPLIT OP_NIP 00 OP_CAT OP_BIN2NUM
+    OP_DUP OP_0 OP_GREATERTHAN OP_VERIFY
     OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
     OP_2DUP OP_LESSTHANOREQUAL OP_VERIFY
     OP_TOALTSTACK
@@ -553,7 +554,9 @@ const PATH1_OUTPUT_ONE_ASM = `
     OP_OVER OP_BIN2NUM OP_0 OP_GREATERTHAN OP_VERIFY
     OP_SWAP OP_TOALTSTACK
     14 OP_SPLIT
-    OP_SWAP OP_TOALTSTACK
+    OP_SWAP
+    OP_DUP OP_SIZE OP_NIP 14 OP_NUMEQUALVERIFY
+    OP_TOALTSTACK
     OP_2 OP_SPLIT
     OP_SWAP OP_TOALTSTACK
     01ff OP_EQUALVERIFY
@@ -687,6 +690,7 @@ const authorityIdentityAsm = (flagMaskHex: string) => `
     OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
     OP_TOALTSTACK
     OP_SIZE OP_1SUB OP_SPLIT OP_NIP 00 OP_CAT OP_BIN2NUM
+    OP_DUP OP_0 OP_GREATERTHAN OP_VERIFY
     OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
     OP_2DUP OP_LESSTHANOREQUAL OP_VERIFY
     OP_TOALTSTACK
@@ -804,6 +808,7 @@ export const PATH2_REFRESH_ASM = `
     OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
     OP_TOALTSTACK
     OP_SIZE OP_1SUB OP_SPLIT OP_NIP 00 OP_CAT OP_BIN2NUM
+    OP_DUP OP_0 OP_GREATERTHAN OP_VERIFY
     OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
     OP_2DUP OP_LESSTHANOREQUAL OP_VERIFY
     OP_TOALTSTACK
@@ -912,8 +917,13 @@ export const PATH3_FREEZE_ASM = `
 // §4.4 Path 4 — confiscate SUFFIX (spec §9.5)
 // ---------------------------------------------------------------------------
 // Produces exactly 1 Normal output with amount preserved, owner = new_owner
-// (authority chooses, supplied via output_tuple), new_depth = 0. Same-template
-// reconstruction reuses body_before_tail cache from §3.5 — no h_X push needed.
+// (authority chooses, supplied via output_tuple), new_depth = my_depth
+// (PRESERVED — per Step C Critical #1 / decision #39). Confiscate is a pure
+// ownership change and MUST NOT reset attestation_depth; the rolling-freshness
+// invariant (§6.3) is maintained by inheriting the source UTXO's depth so that
+// `depth = 0` unambiguously implies issuer attestation. Symmetric with freeze.
+// Prior-draft behavior (0000 literal) is rejected. Same-template reconstruction
+// reuses body_before_tail cache from §3.5 — no h_X push needed.
 export const PATH4_CONFISCATE_ASM = `
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
   02 OP_AND 02 OP_EQUALVERIFY
@@ -928,7 +938,9 @@ export const PATH4_CONFISCATE_ASM = `
   OP_OVER OP_BIN2NUM OP_EQUALVERIFY
   OP_DROP
   OP_SWAP OP_TOALTSTACK
-  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  14 OP_SPLIT OP_SWAP
+  OP_DUP OP_SIZE OP_NIP 14 OP_NUMEQUALVERIFY
+  OP_TOALTSTACK
   OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
   01FF OP_EQUALVERIFY
   OP_FROMALTSTACK
@@ -942,7 +954,7 @@ export const PATH4_CONFISCATE_ASM = `
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  0000 OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
   ${VARINT_SERIALIZE_ASM}
 

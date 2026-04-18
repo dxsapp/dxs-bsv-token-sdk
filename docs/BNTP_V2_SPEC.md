@@ -124,6 +124,15 @@ OP_RETURN
 
 Body = marker + PREFIX + SUFFIX. No WHITELIST block (removed from v2).
 
+**Normative: body_before_tail walk direction (Gap 4.2 closure).** When the locking script needs to isolate `body_before_tail` (= `[Body marker] ‖ [PREFIX] ‖ [SUFFIX]`, used in output reconstruction) from its own `scriptCode` (= `[Variable prefix] ‖ [body_before_tail] ‖ [OP_RETURN] ‖ [Tail]`), it MUST use **forward walk** from the start of scriptCode:
+
+1. Parse and strip `[Variable prefix]` (owner push + action_data + OP_2DROP) using length-prefix reads on the owner push, followed by the 1-byte action_data and 1-byte OP_2DROP opcode.
+2. The remainder is `[body_before_tail] ‖ [OP_RETURN] ‖ [Tail]`.
+3. Locate OP_RETURN (byte `0x6a`) at a deployment-time-known fixed offset: `|body_before_tail| = |PREFIX| + |SUFFIX| + 2` (the `+2` is the body marker). This offset is a constant resolved by the SDK at template compile time and patched into the locking script.
+4. Split at the OP_RETURN offset: left part = `body_before_tail`, right part starts with OP_RETURN followed by Tail.
+
+Backward walk (scanning for OP_RETURN from end) is rejected: optionalData may legitimately contain `0x6a` bytes, making back-scan ambiguous. Forward walk with deployment-time-known offset is unambiguous.
+
 ### 5.1 Variable prefix
 
 | Field      | Size                                                     | Content             |
@@ -413,6 +422,20 @@ Path_id values are template-scoped (not global). Normal uses 1..4, Frozen uses 3
 
 `M` is pushed explicitly (rather than inferred via `OP_DEPTH` tricks) for auditability and deterministic stack arithmetic. Script reads `M`, unrolls output reconstruction loop gated on `i < M`.
 
+**Normative: output_tuple field encoding (Gap 4.3 closure).** Each output_tuple field is pushed as **raw bytes, without push-opcode length prefix**:
+
+- `amount`: 16 raw bytes (uint128 LE), pushed as a 16-byte push.
+- `owner`: 20 raw bytes (PKH) OR 35-171 raw bytes (MPKH preimage); pushed as a single data push. Locking script determines PKH vs MPKH by reading the stored byte length (via `OP_SIZE`) and by the owner-MPKH flag bit 5 in tail.
+- `new_depth`: 2 raw bytes (uint16 LE), pushed as a 2-byte push.
+- `body_marker`: 2 raw bytes (e.g., `0x01 0xff` for Normal target), pushed as a 2-byte push.
+
+The locking script, during output reconstruction, **constructs the push-opcode length prefix** from the stored owner's byte length to produce the canonical locking-script's variable prefix bytes for the target output. Specifically:
+
+- 20-byte PKH owner → emit `0x14` (direct-push length byte) + 20 bytes.
+- 35-171 byte MPKH preimage → emit `OP_PUSHDATA1 (0x4c)` + 1-byte length + preimage bytes.
+
+SDK tx-builder responsibility: pack the owner field as raw bytes (no push prefix) into the output_tuple; locking script reconstructs the prefix on-chain. This keeps per-tuple push encoding predictable (no ambiguity about whether the first byte is a length or data).
+
 **Script verifies:**
 
 1. Owner sig valid (standard or MPKH per flag bit 5)
@@ -428,7 +451,7 @@ Path_id values are template-scoped (not global). Normal uses 1..4, Frozen uses 3
     - Is a Normal UTXO (body_marker = 0x01ff)
     - Has same tokenId as this UTXO
     - Has same issuerPkh, authorityFlags, freezeAuthHash, confiscAuthHash, optionalData (byte-exact)
-    - **Depth saturation (Gap 1 closure):** `new_depth == min(max_input_depth + 1, 65535)`. Once a UTXO reaches depth 65535, subsequent flex-transfers saturate rather than overflow. A saturated UTXO is practically unusable (no well-behaved wallet will accept it; off-chain freshness policy will reject far earlier), but script stays safe from uint16 overflow. Saturated UTXOs can still be refreshed (depth resets to 0) or confiscated.
+    - **Depth saturation (Gap 1 closure):** `new_depth == min(max_input_depth + 1, 65535)`. Once a UTXO reaches depth 65535, subsequent flex-transfers saturate rather than overflow. A saturated UTXO is practically unusable (no well-behaved wallet will accept it; off-chain freshness policy will reject far earlier), but script stays safe from uint16 overflow. Saturated UTXOs can still be refreshed (depth resets to 0) or confiscated. **Implementation (Gap 4.4):** `min()` in BSV Script = explicit branch via `OP_DUP <65535> OP_GREATERTHAN OP_IF OP_DROP <65535> OP_ENDIF` (~8b) applied to `max_input_depth + 1` before comparing to output's `new_depth`.
     - `new_depth ≤ 65535` (uint16 bound check, redundant given saturation but kept as defense-in-depth)
     - `amount ≥ 1` (anti-dust)
 11. `Σ amounts_in_array == Σ output_amounts` (conservation)
@@ -891,7 +914,7 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 ## 15. Resolved decisions (from user consultation)
 
 | #   | Decision                                | Outcome                                                                                                                                                                                                          |
-| --- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ----------------- | ------------------- | ------------------ |
+| --- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ----------------- | ------------------- | ------------------------------------------------------------------------------------- |
 | 1   | Swap architecture                       | External protocol layer, not in BNTP core                                                                                                                                                                        |
 | 2   | Issuer liveness model                   | Rolling attestation (D+B combo) via depth counter; subscription business model                                                                                                                                   |
 | 3   | Owner PKH/MPKH                          | Both supported (flag bit 5)                                                                                                                                                                                      |
@@ -913,7 +936,7 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 | 19  | Body hash manifest pattern              | Accepted as WHITELIST replacement. 32b per cross-reference, not 128b block. §5.5.                                                                                                                                |
 | 20  | G5 gate target                          | Revised from ~2000b to ~2500b per Phase 0 pseudo-ASM validation. §11.1.                                                                                                                                          |
 | 21  | Depth overflow handling                 | **A: saturate at 65535.** `new_depth = min(max_input_depth + 1, 65535)`. §9.2 rule 10.                                                                                                                           |
-| 22  | `amounts_in_array` length               | **A: derive from outpoints count.** `                                                                                                                                                                            | amounts_in_array | == N × 16`, N = ` | all_input_outpoints | /36`. §9.2 rule 6. |
+| 22  | `amounts_in_array` length               | **A: derive from outpoints count.** `                                                                                                                                                                            | amounts_in_array | == N × 16`, N = ` | all_input_outpoints | /36`. §9.2 rule 6.                                                                    |
 | 23  | Input layout contiguity                 | **A: BNTP inputs [0..N-1], funding at N.** Bound via `hashPrevouts` concatenation. §9.2 rule 2.                                                                                                                  |
 | 24  | Null-data canonical encoding            | **A': force direct-push minimal** for all fields ≤ 75 bytes (32, 36, 33). Saves ~3b/tx vs forcing OP_PUSHDATA1. §7.2.1.                                                                                          |
 | 25  | Max N bound on flex-transfer            | **B': N ≤ 32.** Compromise between expressiveness (consolidate 32 in one tx) and worst-case unlocking (~1.9 KB). §9.2 rule 7.                                                                                    |
@@ -923,6 +946,8 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 | 29  | Explicit PKH owner CHECKSIGVERIFY       | **Required.** Identity (HASH160 match) + authorization (CHECKSIGVERIFY) are independent; both mandatory. Covenant CHECKSIG is preimage-auth only, not owner-auth. +~5b PREFIX. §8.1.                             |
 | 30  | Explicit `M` push in flex-transfer      | **Required.** M ∈ [1,4] pushed as ScriptNum before output_tuples. Avoids fragile OP_DEPTH-based derivation. +~3b body. §9.2.                                                                                     |
 | 31  | Consensus-rules dependency              | **BSV post-Genesis required.** Normal body exceeds pre-Genesis opcode/stack-element limits. SDK gates deploys to post-Genesis networks. §13.6.                                                                   |
+| 32  | `body_before_tail` walk direction       | **Forward walk from start of scriptCode.** Deployment-time-known offset (`                                                                                                                                       | PREFIX           | +                 | SUFFIX              | +2`) locates OP_RETURN. Backward scan rejected (optionalData may contain `0x6a`). §5. |
+| 33  | `output_tuple` field encoding           | **Raw bytes, no push-opcode length prefix.** Locking script reconstructs the push prefix (`14` for 20b PKH, `4c XX` for MPKH preimage) on-chain during candidate output assembly. §9.2.                          |
 
 ---
 
@@ -953,4 +978,5 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 - **2026-04-18** — Initial draft of BNTP v2. Pivot from v1 after full-tx footprint analysis showed v1 did not strictly dominate DSTAS. v2 redefines success as "solve STAS pains" not "smaller footprint". Swaps external, amount-in-tail, issuer attestation via depth-based rolling model. 12 design questions resolved with user input (see §15).
 - **2026-04-18** — Pseudo-ASM validation (opus) measured Normal body at **2461b** — low in PIVOT band vs initial ≤2000b target. Pain-resolution analysis (sonnet) scored BNTP v2 at 61/105 vs DSTAS 26.5/105 weighted (merge + B2G dominate, adoption friction -1). User ratified 8 additional design decisions + 3 SPEC AMENDMENT REQUESTs resolving pseudo-ASM OPEN QUESTIONs. Spec updated: §5.5 body hash manifest (replaces whitelist commitment), §9.2.1 max_input_depth collective enforcement, §9.3 MPKH issuer royalty owner, §9.6 redeem as flex-transfer (no dedicated path), §9.9.1 Contract tail with amount field, §9.11 uint128-vs-ScriptNum runtime cap, §11.1 G5 gate revised to ≤2500b. Verdict: **PASS under revised gate**. Proceed to Phase 1 planning.
 - **2026-04-18** — Security / workflow review closed 6 spec gaps (decisions #21-#26, §15): depth overflow saturation (§9.2), `amounts_in_array` length derived from outpoints count (§9.2), input-layout contiguity rule BNTP inputs [0..N-1] + funding at N (§9.2), null-data canonical direct-push-minimal encoding (§7.2.1), max flex-transfer fan-in `N ≤ 32` (§9.2), and SDK deploy-time template hash verification tool as Phase 1 deliverable (§14). On-chain body impact: ~+35b added via extra checks → estimated Normal body ≈ **2496b**, still PASS under revised G5 gate (≤ 2500b) — edge case, exactly at boundary. Gap 4 is a **decrease** of ~3b per null-data tx (direct push < PUSHDATA1).
+- **2026-04-18** — **A.1.1 real ASM measurement** (`BNTP_V2_NORMAL_TEMPLATE_A1_1_REPORT.md`, artifact `src/bntp/v2/templates/normal-body.ts`): Normal PREFIX + flex-transfer SUFFIX compiled to **1901 bytes** via opus agent. Verdict: **PASS** (~37% under G5 ceiling 2600b, ~22% under pseudo-ASM claim 2461b). A.1.0 audit was asymmetrically miscalibrated: too pessimistic on PREFIX (preimage parse 121b vs predicted 180-300b, tail cache 164b in audit mid-range), too optimistic on output reconstruction (620b vs predicted 360-440b). Closed 2 new spec gaps surfaced during real ASM writing (decisions #32-#33, §15): (32) `body_before_tail` walk direction = forward from scriptCode start via deployment-time offset §5; (33) `output_tuple` field encoding = raw bytes, locking script reconstructs push prefixes on-chain §9.2. Also documented implementation detail for decision #21 depth saturation via explicit `OP_GREATERTHAN OP_IF` branch §9.2. A.2 remaining budget: ~700b slack (audit projects path 2+3+4 at 810-920b — tight, near PIVOT band). DSTAS finding: confirmed high-confidence that DSTAS PKH owner-auth relies solely on covenant CHECKSIG (no separate owner-sig), suggesting dormant DSTAS vulnerability — filed for separate investigation, does not block BNTP v2.
 - **2026-04-18** — **A.1.0 pseudo-ASM audit** (`BNTP_V2_NORMAL_TEMPLATE_AUDIT.md`) closed 5 additional decisions (#27-#31): (27) cross-template body for rare paths via hash + unlocking-push (Normal↔Frozen) §5.5.1; (28) Contract inlines Normal body as constant (§5.5.2) — Contract body grows 500b → ~3100b but saves N×2500b in issue unlocking; (29) explicit PKH owner CHECKSIGVERIFY separate from covenant CHECKSIG §8.1; (30) explicit `M` (output count) push in flex-transfer unlocking §9.2; (31) BSV post-Genesis consensus requirement normative §13.6. Unlocking sizes revised: freeze ~960b, unfreeze/confisc-from-Frozen ~2760b (due to target body push). Normal body projection bumped 2496b → **~2550-2600b** (upper PASS band). Per-UTXO comparison to DSTAS adjusted: **−12%** Normal (was −15%), Frozen **−73%** (unchanged), Contract no longer per-UTXO-comparable (one-shot). Spec now frozen for A.1.1 real ASM writing.

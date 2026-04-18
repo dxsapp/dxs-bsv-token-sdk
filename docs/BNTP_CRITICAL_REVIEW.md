@@ -295,6 +295,7 @@ Pivot если:
   - `max_input_depth` semantics normative in §9.2.1
   - G5 gate target revised from ~2000b to ~2500b (matches pseudo-ASM reality, features intact) → §11.1
   - **Status: BNTP v2 spec cleanup complete. Normal body at 2461b = PASS under revised gate.** Spec ready for Phase 1 planning. All design ambiguities resolved.
+- **2026-04-18** — **Security / workflow review: 6 spec gaps closed** (decisions #21-#26 in spec §15). Depth overflow → saturate at 65535 (§9.2); `amounts_in_array` length derived from outpoints count (§9.2); input layout contiguity BNTP [0..N-1] + funding at N (§9.2); null-data canonical direct-push-minimal encoding for fields ≤ 75b (§7.2.1); max flex-transfer fan-in `N ≤ 32` (§9.2); SDK deploy-time template hash verification tool as Phase 1 deliverable (§14). On-chain body impact: ~+35b → Normal body ≈ **2496b**, still PASS under G5 ≤ 2500b (edge case, exactly at boundary). Spec is now frozen for Phase 1 implementation.
 - **2026-04-17** — **Phase 0 executed** via wave package `docs/stream-tasks/bntp-phase-0-pseudo-asm-wave/`. Three parallel opus agents (S1 Normal pseudo-ASM, S2 whitelist proof, S3 anchor/follower algorithm). Results:
   - G1 (Normal body ≤ 2400b): **PIVOT** — actual ~4640b, optimized floor ~3600b. Budget was unrealistic.
   - G2 (whitelist soundness): **PASS** — 5/5 claims defended, 11 new surfaces enumerated 0 unmitigated, scheme formally sound (constant-function argument).

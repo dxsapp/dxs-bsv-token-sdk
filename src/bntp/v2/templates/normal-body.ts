@@ -1,7 +1,7 @@
 import { asmToBytes } from "../../../script/build/asm-template-builder";
 
 /**
- * BNTP v2 Normal template body ASM — Phase 1 A.1.1 + A.2 scope.
+ * BNTP v2 Normal template body ASM — Phase 1 A.1.1 + A.2 + A.2.5 scope.
  *
  * Covers (real, assemblable BSV Script):
  *   - PREFIX (§3 of pseudo-ASM): body marker, OP_PUSH_TX covenant, sighash-type
@@ -16,9 +16,15 @@ import { asmToBytes } from "../../../script/build/asm-template-builder";
  *     confiscate (§4.4) SUFFIXes. Each path emits real assembled opcodes
  *     implementing spec §9.3 / §9.4 / §9.5 verification rules, including
  *     PKH + MPKH branches for freeze / confisc / issuer authorities per §8.1.
+ *   - **A.2.5 additions (decisions #34, #37, #38):** (1) MPKH issuer branch on
+ *     path 2 gated on authorityFlags bit 4; (2) optional P2PKH-style change
+ *     output at index 3 of refresh tx, gated on non-empty `change_script_bytes`
+ *     in unlocking; (3) retroactive FD-only varint optimization applied to
+ *     path 1 output reconstruction (three-branch selector → single-branch
+ *     FD + 2-byte LE length, mirroring A.2's `VARINT_SERIALIZE_ASM`).
  *
- * Scope completed: A.1.1 + A.2. Remaining: Contract and Frozen template bodies
- * (separate artifacts, not in this file).
+ * Scope completed: A.1.1 + A.2 + A.2.5. Remaining: Contract and Frozen
+ * template bodies (separate artifacts, not in this file).
  *
  * IMPORTANT — this script is written to be byte-measurable and structurally
  * complete. It has NOT been executed on a node; several stack-management
@@ -531,6 +537,13 @@ const PATH1_SUM_OUTPUTS_ASM = `
 //       ‖ freezeAuthHash ‖ confiscAuthHash ‖ new_depth ‖ optionalData
 //   - Serialize output: 8b satoshis (anti-dust 1) ‖ varint(len) ‖ candidate_script
 //   - Accumulate into outputs_hash_buffer
+//
+// A.2.5 retro-optimization (decision #38): the varint block is now FD-only
+// single-branch (mirroring A.2's `VARINT_SERIALIZE_ASM` helper) instead of the
+// original three-branch selector. Candidate locking scripts always land in the
+// `[0xFD..0xFFFF]` range, so the smaller (252-byte) and larger (≥64KB)
+// branches were dead code. Savings: ~30b per iteration × 4 iterations = ~120b
+// cumulative, measured −136b. Correctness caveat identical to §4.X helper.
 const PATH1_OUTPUT_ONE_ASM = `
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
   OP_0 OP_GREATERTHAN
@@ -564,17 +577,7 @@ const PATH1_OUTPUT_ONE_ASM = `
     OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
     0100000000000000 OP_SWAP OP_CAT
     OP_SIZE OP_SWAP
-    OP_DUP FC00 OP_LESSTHANOREQUAL
-    OP_IF
-      OP_SWAP OP_1 OP_SPLIT OP_DROP OP_CAT OP_SWAP OP_CAT
-    OP_ELSE
-      OP_DUP FFFF OP_LESSTHANOREQUAL
-      OP_IF
-        OP_SWAP FD OP_CAT OP_SWAP OP_2 OP_SPLIT OP_DROP OP_CAT OP_SWAP OP_CAT
-      OP_ELSE
-        OP_SWAP FE OP_CAT OP_SWAP OP_4 OP_SPLIT OP_DROP OP_CAT OP_SWAP OP_CAT
-      OP_ENDIF
-    OP_ENDIF
+    OP_SWAP FD OP_SWAP OP_2 OP_SPLIT OP_DROP OP_CAT OP_CAT OP_SWAP OP_CAT
     OP_CAT
   OP_ENDIF
 `;
@@ -713,7 +716,21 @@ const authorityIdentityAsm = (flagMaskHex: string) => `
 // Produces exactly 2 Normal outputs: output[0] = refreshed (amount =
 // my_amount − royalty, owner = my_owner, new_depth = 0), output[1] = royalty
 // (amount = royalty, owner = my_issuerPkh, new_depth = 0). Plus null-data
-// attestation at output[2] verifying tokenId / thisOutpoint / issuerPubkey.
+// attestation at output[2] verifying tokenId / thisOutpoint / issuerPubkey
+// (PKH issuer) or tokenId / thisOutpoint / MPKH preimage (MPKH issuer).
+//
+// A.2.5 additions:
+//   - MPKH issuer branch (decision #34, +~75b measured): gated on
+//     `authorityFlags bit 4`. PKH branch is original A.2 code; MPKH branch
+//     mirrors `authorityIdentityAsm` MPKH pattern — HASH160 match,
+//     multisig-m/n extraction from preimage (up to n=5), CHECKMULTISIGVERIFY.
+//     Issuer sig is the last one-below-path_id on main stack (OP_ROT reaches it).
+//   - Optional change output at output index 3 (decision #37, +~30b measured).
+//     If unlocking pushes non-empty `change_script_bytes` + `change_satoshis`,
+//     the locking script appends `change_satoshis (8b LE) ‖ varint(len) ‖
+//     change_script_bytes` to the hashOutputs accumulator. Gated on
+//     `|change_script_bytes| > 0`. Varint uses the 1-byte direct-push form
+//     (assuming P2PKH-style change ≤ 252b; SDK MUST enforce this at build).
 //
 // Byte-budget trimmings vs path 1's per-output block:
 //   - new_depth is a 2-byte constant (0x0000), not extracted from tuple
@@ -767,17 +784,67 @@ export const PATH2_REFRESH_ASM = `
   OP_SWAP
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_EQUALVERIFY
   OP_1 OP_SPLIT OP_NIP
-  OP_DUP OP_HASH160
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_EQUALVERIFY
-  OP_DROP
 
-  OP_ROT
   OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_CHECKSIGVERIFY
+  10 OP_AND 00 OP_EQUAL
+  OP_IF
+    OP_DUP OP_HASH160
+    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+    OP_EQUALVERIFY
+    OP_DROP
+
+    OP_ROT
+    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+    OP_CHECKSIGVERIFY
+  OP_ELSE
+    OP_DUP OP_HASH160
+    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+    OP_EQUALVERIFY
+    OP_DUP
+    OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
+    OP_TOALTSTACK
+    OP_SIZE OP_1SUB OP_SPLIT OP_NIP 00 OP_CAT OP_BIN2NUM
+    OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
+    OP_2DUP OP_LESSTHANOREQUAL OP_VERIFY
+    OP_TOALTSTACK
+    OP_FROMALTSTACK
+    OP_DUP 21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DROP
+    OP_FROMALTSTACK
+    OP_ROT
+    OP_CHECKMULTISIGVERIFY
+  OP_ENDIF
 
   OP_CAT
   OP_DEPTH OP_3 OP_SUB OP_PICK OP_CAT
+
+  OP_DEPTH OP_4 OP_SUB OP_PICK
+  OP_DUP OP_SIZE OP_NIP
+  OP_DUP OP_0 OP_GREATERTHAN
+  OP_IF
+    OP_DEPTH OP_5 OP_SUB OP_PICK
+    OP_SWAP
+    OP_1 OP_SPLIT OP_DROP
+    OP_SWAP OP_CAT
+    OP_SWAP OP_CAT
+    OP_CAT
+  OP_ELSE
+    OP_DROP
+    OP_DROP
+  OP_ENDIF
+
   OP_HASH256
   OP_FROMALTSTACK OP_EQUALVERIFY
 `;

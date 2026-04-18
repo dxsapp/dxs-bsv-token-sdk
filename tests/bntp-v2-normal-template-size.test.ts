@@ -10,26 +10,32 @@ import {
 import { asmToBytes } from "../src/script/build/asm-template-builder";
 
 /**
- * BNTP v2 Normal template — body size gate (Phase 1 A.1.1 + A.2).
+ * BNTP v2 Normal template — body size gate (Phase 1 A.1.1 + A.2 + A.2.5).
  *
  * Measures the compiled body and asserts the G5 gate bands:
  *   - PASS   ≤ 2600b
  *   - PIVOT  2600-2700b
  *   - ABORT  > 2700b
  *
+ * A.2.5 applied three targeted ASM edits: (1) MPKH issuer branch on path 2
+ * (decision #34); (2) optional change output at index 3 of refresh tx
+ * (decision #37); (3) retroactive FD-only varint optimization on path 1
+ * output reconstruction (decision #38). Net effect: +123b path 2, −136b
+ * path 1 recon, total body 2587 → 2574b PASS (26b margin under G5).
+ *
  * Also asserts sanity: the body starts with the canonical marker
  * `4c 02 01 ff 75` (OP_PUSHDATA1 0x02 0x01 0xff OP_DROP) per spec §5.
  *
  * Lower bound is intentionally relaxed to 1500b — A.1.1 measurement came in
  * below the pseudo-ASM's claimed 2461b and the audit's revised 2363-2693b
- * range. A.2 (paths 2, 3, 4) added ~686b bringing total to ~2587b, still
- * within PASS band. See docs/BNTP_V2_NORMAL_TEMPLATE_A1_1_REPORT.md and
- * docs/BNTP_V2_NORMAL_TEMPLATE_A2_REPORT.md for measurement discussion.
+ * range. See docs/BNTP_V2_NORMAL_TEMPLATE_A1_1_REPORT.md,
+ * docs/BNTP_V2_NORMAL_TEMPLATE_A2_REPORT.md, and
+ * docs/BNTP_V2_NORMAL_TEMPLATE_A2_5_REPORT.md for measurement discussion.
  * The tight lower bound is kept as a regression guard; a measurement below
  * 1500b would indicate a missing major section (e.g. output reconstruction
  * omitted).
  */
-describe("BNTP v2 Normal template — body size (A.1.1 + A.2)", () => {
+describe("BNTP v2 Normal template — body size (A.1.1 + A.2 + A.2.5)", () => {
   test("body compiles to deterministic bytes", () => {
     const firstPass = NORMAL_BODY_BYTES;
     const secondPass = (() => {
@@ -57,6 +63,13 @@ describe("BNTP v2 Normal template — body size (A.1.1 + A.2)", () => {
 
   test("body size is within ABORT ceiling (≤ 2700b)", () => {
     expect(NORMAL_BODY_SIZE).toBeLessThanOrEqual(2700);
+  });
+
+  test("body size is within PASS ceiling (≤ 2600b) — G5 strict PASS", () => {
+    // A.2.5 tightened this assertion: post-decisions #34/#37/#38 the body
+    // lands at 2574b (26b margin under 2600b G5 ceiling). A regression above
+    // 2600b would force a PIVOT re-evaluation.
+    expect(NORMAL_BODY_SIZE).toBeLessThanOrEqual(2600);
   });
 
   test("body size is above regression floor (≥ 1500b)", () => {

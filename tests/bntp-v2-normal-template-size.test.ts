@@ -3,11 +3,14 @@ import {
   NORMAL_BODY_BYTES,
   NORMAL_BODY_SECTION_SIZES,
   NORMAL_BODY_SIZE,
+  PATH2_REFRESH_ASM,
+  PATH3_FREEZE_ASM,
+  PATH4_CONFISCATE_ASM,
 } from "../src/bntp/v2/templates/normal-body";
 import { asmToBytes } from "../src/script/build/asm-template-builder";
 
 /**
- * BNTP v2 Normal template — body size gate (Phase 1 A.1.1).
+ * BNTP v2 Normal template — body size gate (Phase 1 A.1.1 + A.2).
  *
  * Measures the compiled body and asserts the G5 gate bands:
  *   - PASS   ≤ 2600b
@@ -17,15 +20,16 @@ import { asmToBytes } from "../src/script/build/asm-template-builder";
  * Also asserts sanity: the body starts with the canonical marker
  * `4c 02 01 ff 75` (OP_PUSHDATA1 0x02 0x01 0xff OP_DROP) per spec §5.
  *
- * Lower bound is intentionally relaxed to 1500b — the real (measured)
- * implementation in A.1.1 came in below the pseudo-ASM's claimed 2461b and
- * the audit's revised 2363-2693b range. See
- * docs/BNTP_V2_NORMAL_TEMPLATE_A1_1_REPORT.md §3 for the finding discussion.
+ * Lower bound is intentionally relaxed to 1500b — A.1.1 measurement came in
+ * below the pseudo-ASM's claimed 2461b and the audit's revised 2363-2693b
+ * range. A.2 (paths 2, 3, 4) added ~686b bringing total to ~2587b, still
+ * within PASS band. See docs/BNTP_V2_NORMAL_TEMPLATE_A1_1_REPORT.md and
+ * docs/BNTP_V2_NORMAL_TEMPLATE_A2_REPORT.md for measurement discussion.
  * The tight lower bound is kept as a regression guard; a measurement below
  * 1500b would indicate a missing major section (e.g. output reconstruction
  * omitted).
  */
-describe("BNTP v2 Normal template — body size (A.1.1)", () => {
+describe("BNTP v2 Normal template — body size (A.1.1 + A.2)", () => {
   test("body compiles to deterministic bytes", () => {
     const firstPass = NORMAL_BODY_BYTES;
     const secondPass = (() => {
@@ -85,9 +89,30 @@ describe("BNTP v2 Normal template — body size (A.1.1)", () => {
     ].join("\n");
 
     // Always passes; output is visible with jest --verbose.
-     
+
     console.log(report);
     expect(NORMAL_BODY_SIZE).toBeGreaterThan(0);
+  });
+
+  test("paths 2, 3, 4 are non-stub (byte counts > 50)", () => {
+    // A.2 sanity: each path SUFFIX has real, non-trivial ASM replacing the
+    // A.1.1 `OP_FALSE OP_VERIFY` stubs (which compiled to exactly 2b each).
+    // A path measuring ≤ 50b would indicate accidental regression to a stub.
+    const path2Size = asmToBytes(PATH2_REFRESH_ASM).length;
+    const path3Size = asmToBytes(PATH3_FREEZE_ASM).length;
+    const path4Size = asmToBytes(PATH4_CONFISCATE_ASM).length;
+
+    expect(path2Size).toBeGreaterThan(50);
+    expect(path3Size).toBeGreaterThan(50);
+    expect(path4Size).toBeGreaterThan(50);
+
+    // Also sanity: each path landed in a plausible band per A.2 audit
+    // estimates (path 2 320-380, path 3 280-310, path 4 210-230). We use
+    // loose ceilings since A.2 measured under-audit for paths 2 and 3 via
+    // varint-simplification optimization (see A.2 report §3).
+    expect(path2Size).toBeLessThan(400);
+    expect(path3Size).toBeLessThan(400);
+    expect(path4Size).toBeLessThan(400);
   });
 
   test("G5 gate verdict", () => {
@@ -97,7 +122,6 @@ describe("BNTP v2 Normal template — body size (A.1.1)", () => {
     else if (NORMAL_BODY_SIZE <= 2700) verdict = "PIVOT";
     else verdict = "ABORT";
 
-     
     console.log(`G5 verdict: ${verdict} (${NORMAL_BODY_SIZE} bytes)`);
 
     expect(verdict).not.toBe("ABORT");

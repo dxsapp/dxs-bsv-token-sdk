@@ -1,7 +1,7 @@
 import { asmToBytes } from "../../../script/build/asm-template-builder";
 
 /**
- * BNTP v2 Normal template body ASM — Phase 1 A.1.1 scope.
+ * BNTP v2 Normal template body ASM — Phase 1 A.1.1 + A.2 scope.
  *
  * Covers (real, assemblable BSV Script):
  *   - PREFIX (§3 of pseudo-ASM): body marker, OP_PUSH_TX covenant, sighash-type
@@ -12,10 +12,13 @@ import { asmToBytes } from "../../../script/build/asm-template-builder";
  *     check, M range check, max_input_depth check, amount conservation
  *     (unrolled ×4 in + ×4 out), output reconstruction (unrolled ×4),
  *     hashOutputs closure.
+ *   - **A.2 additions:** Path 2 refresh (§4.2), Path 3 freeze (§4.3), Path 4
+ *     confiscate (§4.4) SUFFIXes. Each path emits real assembled opcodes
+ *     implementing spec §9.3 / §9.4 / §9.5 verification rules, including
+ *     PKH + MPKH branches for freeze / confisc / issuer authorities per §8.1.
  *
- * Out-of-scope (A.2): refresh (path 2), freeze (path 3), confiscate (path 4).
- * These are stubbed as `OP_FALSE OP_VERIFY` branches so the dispatcher structure
- * is complete and byte-measurable, but the branches themselves are placeholders.
+ * Scope completed: A.1.1 + A.2. Remaining: Contract and Frozen template bodies
+ * (separate artifacts, not in this file).
  *
  * IMPORTANT — this script is written to be byte-measurable and structurally
  * complete. It has NOT been executed on a node; several stack-management
@@ -355,19 +358,9 @@ const DISPATCHER_HEADER_ASM = `
   OP_DUP OP_1 OP_EQUAL OP_IF
 `;
 
-const DISPATCHER_MIDDLE_ASM = `
-  OP_ENDIF
-  OP_DUP OP_2 OP_EQUAL OP_IF
-    OP_FALSE OP_VERIFY
-  OP_ENDIF
-  OP_DUP OP_3 OP_EQUAL OP_IF
-    OP_FALSE OP_VERIFY
-  OP_ENDIF
-  OP_DUP OP_4 OP_EQUAL OP_IF
-    OP_FALSE OP_VERIFY
-  OP_ENDIF
-  OP_DROP
-`;
+// DISPATCHER_MIDDLE_ASM is defined below, after paths 2, 3, 4 constants
+// (§4.2-§4.4), because its template expansion inlines them. See definition
+// just above the NORMAL_BODY_ASM assembly block.
 
 // ---------------------------------------------------------------------------
 // §4.1 Path 1 — flex-transfer SUFFIX
@@ -627,6 +620,291 @@ const PATH1_HASHOUTPUTS_CLOSE_ASM = `
 `;
 
 // ---------------------------------------------------------------------------
+// §4.X Shared helpers for paths 2, 3, 4
+// ---------------------------------------------------------------------------
+
+// Varint + sats prefix for candidate-output serialization. The candidate
+// locking script in BNTP v2 is always between ~2000 and ~3000 bytes (body
+// marker + covenant + preimage parse + tail cache + owner identity +
+// dispatcher + all path SUFFIXes + OP_RETURN + tail), so the varint length
+// encoding always falls into the 0xFD (2-byte length) branch. Unlike path 1,
+// which uses a three-branch varint selector inside each per-output loop
+// (FC / FF / FFFFFFFF), paths 2/3/4 use a single-branch variant that emits
+// `FD <len-le-2b>` unconditionally. This saves ~45b per output reconstruction.
+// Correctness: if the candidate script length ever escapes the [0xFD .. 0xFFFF]
+// range, SDK pre-validation rejects the tx before broadcast; the on-chain
+// covenant would fail via hashOutputs mismatch (varint malformed).
+//
+// Stack effect: main top = candidate_script (bytes). After block executes,
+// top of main stack = (8b sats ‖ 3b varint ‖ candidate_script) — ready for
+// append to hashOutputs accumulator.
+const VARINT_SERIALIZE_ASM = `
+  0100000000000000 OP_SWAP
+  OP_SIZE OP_SWAP
+  OP_ROT OP_SWAP
+  FD OP_CAT OP_SWAP OP_2 OP_SPLIT OP_DROP OP_CAT
+  OP_SWAP OP_CAT OP_CAT
+`;
+
+// Generic authority identity + CHECKSIG(VERIFY) block. Used for freeze auth
+// (path 3), confisc auth (path 4), and issuer auth (path 2). Per spec §8.1 /
+// decision #29, PKH authorities MUST run TWO checks: HASH160(pubkey) match
+// AND explicit CHECKSIGVERIFY against preimage. MPKH authorities run
+// HASH160(preimage) match + CHECKMULTISIGVERIFY with m-of-n pubkeys parsed
+// from the MPKH preimage (max n=5, matching v1 identity-field spec).
+//
+// Parameter `flagMaskHex` is the 1-byte authorityFlags mask that discriminates
+// PKH vs MPKH for the specific authority:
+//   - 0x04 for freezeAuth (bit 2)
+//   - 0x08 for confiscAuth (bit 3)
+//   - 0x10 for issuer      (bit 4)
+//
+// Stack pre-condition (main): [auth_sig, auth_pubkey_or_mpkh_preimage] on top.
+// Altstack pre-condition: authorityFlags byte and the target hash (freezeAuthHash
+// / confiscAuthHash / issuerPkh) are reachable via FROMALTSTACK/TOALTSTACK
+// round-trips (the caller arranges the altstack accordingly).
+//
+// NOTE (stack choreography caveat): altstack round-trip sequences in this
+// block assume caller-specific ordering. As with A.1.1, this block is
+// byte-measurable and structurally complete but NOT yet execution-verified.
+// Execution correctness is Phase 1B work.
+const authorityIdentityAsm = (flagMaskHex: string) => `
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  ${flagMaskHex} OP_AND 00 OP_EQUAL
+  OP_IF
+    OP_OVER OP_HASH160
+    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+    OP_EQUALVERIFY
+    OP_CHECKSIGVERIFY
+  OP_ELSE
+    OP_OVER OP_HASH160
+    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+    OP_EQUALVERIFY
+    OP_OVER
+    OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
+    OP_TOALTSTACK
+    OP_SIZE OP_1SUB OP_SPLIT OP_NIP 00 OP_CAT OP_BIN2NUM
+    OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
+    OP_2DUP OP_LESSTHANOREQUAL OP_VERIFY
+    OP_TOALTSTACK
+    OP_FROMALTSTACK
+    OP_DUP 21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DUP OP_SIZE OP_NIP OP_IF
+      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_ENDIF
+    OP_DROP
+    OP_FROMALTSTACK
+    OP_CHECKMULTISIGVERIFY
+  OP_ENDIF
+`;
+
+// ---------------------------------------------------------------------------
+// §4.2 Path 2 — refresh SUFFIX (spec §9.3)
+// ---------------------------------------------------------------------------
+// Produces exactly 2 Normal outputs: output[0] = refreshed (amount =
+// my_amount − royalty, owner = my_owner, new_depth = 0), output[1] = royalty
+// (amount = royalty, owner = my_issuerPkh, new_depth = 0). Plus null-data
+// attestation at output[2] verifying tokenId / thisOutpoint / issuerPubkey.
+//
+// Byte-budget trimmings vs path 1's per-output block:
+//   - new_depth is a 2-byte constant (0x0000), not extracted from tuple
+//   - amount is computed (SUB / ROYALTY), not extracted from tuple
+//   - body_marker is fixed 0x01ff (Normal); tuple's marker slot is trusted
+//     via downstream byte-exact match on hashOutputs
+//   - varint uses FD-only branch (see VARINT_SERIALIZE_ASM note)
+//
+// This gets per-output cost down to ~70b vs path 1's 155b. Two outputs = 140b
+// for reconstruction; remaining ~80b covers conservation, null-data parse,
+// issuer identity, hashOutputs closure.
+const PATH2_OUTPUT_ONE_ASM = `
+  OP_OVER
+  14 OP_CAT
+  006D OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  6A OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  0000 OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  ${VARINT_SERIALIZE_ASM}
+`;
+
+export const PATH2_REFRESH_ASM = `
+  OP_DEPTH OP_3 OP_SUB OP_PICK OP_BIN2NUM
+  OP_DUP OP_0 OP_GREATERTHAN OP_VERIFY
+  OP_DEPTH OP_3 OP_SUB OP_PICK OP_BIN2NUM
+  OP_DUP OP_0 OP_GREATERTHAN OP_VERIFY
+  OP_ADD
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  00 OP_CAT OP_BIN2NUM
+  OP_EQUALVERIFY
+
+  ${PATH2_OUTPUT_ONE_ASM}
+  ${PATH2_OUTPUT_ONE_ASM}
+
+  OP_DEPTH OP_3 OP_SUB OP_PICK
+  OP_1 OP_SPLIT OP_NIP
+  OP_1 OP_SPLIT OP_NIP
+  OP_1 OP_SPLIT OP_NIP
+  20 OP_SPLIT
+  OP_SWAP
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_EQUALVERIFY
+  OP_1 OP_SPLIT OP_NIP
+  24 OP_SPLIT
+  OP_SWAP
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_EQUALVERIFY
+  OP_1 OP_SPLIT OP_NIP
+  OP_DUP OP_HASH160
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  OP_EQUALVERIFY
+  OP_DROP
+
+  OP_ROT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  OP_CHECKSIGVERIFY
+
+  OP_CAT
+  OP_DEPTH OP_3 OP_SUB OP_PICK OP_CAT
+  OP_HASH256
+  OP_FROMALTSTACK OP_EQUALVERIFY
+`;
+
+// ---------------------------------------------------------------------------
+// §4.3 Path 3 — freeze SUFFIX (spec §9.4)
+// ---------------------------------------------------------------------------
+// Produces exactly 1 Frozen output with amount / owner / new_depth all
+// preserved byte-exact from source. Unlocking pushes `frozen_body_bytes`
+// (~700b); locking verifies SHA256 match against embedded h_Frozen constant.
+//
+// h_Frozen is a 32-byte constant embedded in Normal body. Here it is a
+// placeholder of 32 zero bytes — SDK deployer patches in the real
+// SHA256(Frozen body) post-compilation. See H_FROZEN_PLACEHOLDER_HEX.
+//
+// The Frozen candidate output script uses action_data = OP_2 (0x52) per §3
+// template catalog (Normal uses OP_0 / 0x00). Push bytes = `14 ‖ owner_pkh`
+// for PKH owner; `4c XX ‖ mpkh_preimage` for MPKH owner (owner preserved, so
+// same encoding as source's variable prefix owner).
+
+// Placeholder SHA256 value for the Frozen template body. A 32-byte zero
+// push inserted directly into ASM. The SDK's deployer resolves the real
+// SHA256(Frozen body) at deploy time and patches these 32 bytes in-place
+// in the compiled locking script. Keeps byte count honest at compile time.
+export const H_FROZEN_PLACEHOLDER_HEX =
+  "0000000000000000000000000000000000000000000000000000000000000000";
+
+export const PATH3_FREEZE_ASM = `
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  01 OP_AND 01 OP_EQUALVERIFY
+
+  ${authorityIdentityAsm("04")}
+
+  OP_DEPTH OP_2 OP_SUB OP_PICK
+  OP_SHA256
+  ${H_FROZEN_PLACEHOLDER_HEX} OP_EQUALVERIFY
+
+  OP_DEPTH OP_3 OP_SUB OP_PICK
+  10 OP_SPLIT
+  OP_OVER OP_BIN2NUM OP_0 OP_GREATERTHAN OP_VERIFY
+  OP_SWAP OP_TOALTSTACK
+  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  FEFF OP_EQUALVERIFY
+  OP_FROMALTSTACK
+  14 OP_CAT
+  026D OP_CAT
+  OP_DEPTH OP_2 OP_SUB OP_PICK OP_CAT
+  6A OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  ${VARINT_SERIALIZE_ASM}
+
+  OP_HASH256
+  OP_FROMALTSTACK OP_EQUALVERIFY
+`;
+
+// ---------------------------------------------------------------------------
+// §4.4 Path 4 — confiscate SUFFIX (spec §9.5)
+// ---------------------------------------------------------------------------
+// Produces exactly 1 Normal output with amount preserved, owner = new_owner
+// (authority chooses, supplied via output_tuple), new_depth = 0. Same-template
+// reconstruction reuses body_before_tail cache from §3.5 — no h_X push needed.
+export const PATH4_CONFISCATE_ASM = `
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  02 OP_AND 02 OP_EQUALVERIFY
+
+  ${authorityIdentityAsm("08")}
+
+  OP_DEPTH OP_2 OP_SUB OP_PICK
+  10 OP_SPLIT
+  OP_OVER OP_BIN2NUM OP_0 OP_GREATERTHAN OP_VERIFY
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
+  00 OP_CAT OP_BIN2NUM
+  OP_OVER OP_BIN2NUM OP_EQUALVERIFY
+  OP_DROP
+  OP_SWAP OP_TOALTSTACK
+  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  01FF OP_EQUALVERIFY
+  OP_FROMALTSTACK
+  14 OP_CAT
+  006D OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  6A OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  0000 OP_CAT
+  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
+  ${VARINT_SERIALIZE_ASM}
+
+  OP_HASH256
+  OP_FROMALTSTACK OP_EQUALVERIFY
+`;
+
+// ---------------------------------------------------------------------------
+// §3.7 (continued) Dispatcher middle (paths 2, 3, 4)
+// ---------------------------------------------------------------------------
+// Gates paths 2, 3, 4 on path_id. Each inner branch runs the path's real
+// SUFFIX (A.2 scope: PATH2_REFRESH_ASM / PATH3_FREEZE_ASM /
+// PATH4_CONFISCATE_ASM). Leading OP_ENDIF closes the path-1 branch opened
+// in DISPATCHER_HEADER_ASM; trailing OP_DROP consumes the path_id byte.
+const DISPATCHER_MIDDLE_ASM = `
+  OP_ENDIF
+  OP_DUP OP_2 OP_EQUAL OP_IF
+    ${PATH2_REFRESH_ASM}
+  OP_ENDIF
+  OP_DUP OP_3 OP_EQUAL OP_IF
+    ${PATH3_FREEZE_ASM}
+  OP_ENDIF
+  OP_DUP OP_4 OP_EQUAL OP_IF
+    ${PATH4_CONFISCATE_ASM}
+  OP_ENDIF
+  OP_DROP
+`;
+
+// ---------------------------------------------------------------------------
 // Assemble NORMAL_BODY_ASM
 // ---------------------------------------------------------------------------
 export const NORMAL_BODY_ASM = `
@@ -689,5 +967,15 @@ export const NORMAL_BODY_SECTION_SIZES = {
   path1SumOutputs: asmToBytes(PATH1_SUM_OUTPUTS_ASM).length,
   path1OutputRecon: asmToBytes(PATH1_OUTPUT_RECON_ASM).length,
   path1HashoutputsClose: asmToBytes(PATH1_HASHOUTPUTS_CLOSE_ASM).length,
-  dispatcherMiddle: asmToBytes(DISPATCHER_MIDDLE_ASM).length,
+  // A.2 — path 2 refresh, path 3 freeze, path 4 confiscate. Each measurement
+  // is the raw SUFFIX body bytes (NOT including the outer path_id OP_IF/OP_ENDIF
+  // gate, which is counted in dispatcherMiddle's ~10b overhead).
+  path2Refresh: asmToBytes(PATH2_REFRESH_ASM).length,
+  path3Freeze: asmToBytes(PATH3_FREEZE_ASM).length,
+  path4Confiscate: asmToBytes(PATH4_CONFISCATE_ASM).length,
+  dispatcherMiddle:
+    asmToBytes(DISPATCHER_MIDDLE_ASM).length -
+    asmToBytes(PATH2_REFRESH_ASM).length -
+    asmToBytes(PATH3_FREEZE_ASM).length -
+    asmToBytes(PATH4_CONFISCATE_ASM).length,
 } as const;

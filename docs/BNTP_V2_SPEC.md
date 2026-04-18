@@ -475,8 +475,8 @@ Over-reporting as self-harm is deemed acceptable. No separate per-input-depth ha
 ```
 [refreshed_output_tuple (amount A-royalty, owner unchanged, new_depth=0, body_marker=0x01ff)]
 [royalty_output_tuple (amount royalty, owner=issuerPkh or MPKH, new_depth=0, body_marker=0x01ff)]
-[null-data attestation bytes]
-[change_satoshis? change_script?]
+[null-data attestation bytes]          ← MUST be at output index 2
+[change_script_bytes?]                  ← optional; if present, output index 3 is a change output (see Gap 4.4 closure below)
 [funding_outpoint]
 [preimage]
 [OP_2]                         path_id = 2
@@ -486,18 +486,18 @@ Over-reporting as self-harm is deemed acceptable. No separate per-input-depth ha
 
 **Script verifies:**
 
-1. Owner sig valid (owner consents to pay royalty)
-2. Exactly 2 BNTP outputs at indices 0, 1
-3. Output 0: `amount = my_amount − royalty`, `owner = my_owner`, `new_depth = 0`, tail fields match
-4. Output 1: `amount = royalty`, `owner = issuerPkh` (from my tail), `new_depth = 0`, tail fields match
-5. Conservation: `my_amount == (output_0.amount) + (output_1.amount)`, both positive
-6. Null-data output at index 2:
-   - Format: `OP_FALSE OP_RETURN <tokenId 32b> <thisOutpoint 36b> <issuerPubkey 33b>`
+1. Owner sig valid (identity via HASH160 match + explicit CHECKSIGVERIFY per §8.1; PKH or MPKH per flag bit 5)
+2. Exactly **2 BNTP outputs** at indices 0, 1, followed by null-data at index 2, optionally followed by a single P2PKH-style change output at index 3. **No other outputs permitted.** Any extra output fails `hashOutputs` byte-exact reconstruction.
+3. Output 0: `amount = my_amount − royalty`, `owner = my_owner`, `new_depth = 0`, tail fields match.
+4. Output 1: `amount = royalty`, `owner = issuerPkh` (from my tail), `new_depth = 0`, tail fields match.
+5. Conservation: `my_amount == (output_0.amount) + (output_1.amount)`, both positive.
+6. **Null-data at output index 2 is normative (Gap 4.2 closure).** The locking script parses output[2] as the null-data attestation at fixed stack offset; SDK MUST emit null-data at index 2. Format: `OP_FALSE OP_RETURN <tokenId 32b> <thisOutpoint 36b> <issuerPubkey 33b>`, with canonical direct-push encoding per §7.2.1.
    - `tokenId` == my.tokenId
    - `thisOutpoint` == my_outpoint (from preimage)
-   - `HASH160(issuer_pubkey)` == my.issuerPkh (for PKH issuer) OR `HASH160(issuer_pubkey_as_MPKH_preimage)` == my.issuerPkh (if flag bit 4)
-7. Issuer `CHECKSIGVERIFY` against preimage — standard covenant sig. This binds all outputs (including null-data) to issuer's approval via SIGHASH_ALL.
-8. hashOutputs matches reconstruction
+   - `HASH160(issuer_pubkey)` == my.issuerPkh (for PKH issuer) OR `HASH160(issuer_pubkey_as_MPKH_preimage)` == my.issuerPkh (if flag bit 4 = 1)
+7. Issuer identity + CHECKSIGVERIFY per §8.1: HASH160(issuer_pubkey or MPKH preimage) == my.issuerPkh AND OP_CHECKSIGVERIFY(issuer_sig, issuer_pubkey_or_first_MPKH_component, preimage). PKH vs MPKH branch on `authorityFlags bit 4`. **MPKH issuer is normative (Gap 4.1 closure) — implementations MUST support both PKH and MPKH issuer branches.** MPKH issuer branch mirrors `authorityIdentityAsm` pattern (+~75b body).
+8. **Optional change output at index 3 (Gap 4.4 closure).** If the unlocking pushes `change_script_bytes` as a non-empty byte string, the locking script serializes the change output `(change_satoshis 8b LE ‖ varint(len) ‖ change_script_bytes)` and appends to the hashOutputs accumulator. `change_satoshis = funding_input_satoshis − refresh_fees − dust(2 sats)`, computed on-chain from `preimage.satoshis` of funding input (not directly accessible — SDK provides `change_satoshis` as a push and locking verifies via hashOutputs byte-exact match). If `change_script_bytes` is empty (or missing), no change output is appended. Change output is P2PKH-style (standard Bitcoin) — no BNTP semantics.
+9. hashOutputs matches reconstruction (output[0] ‖ output[1] ‖ null-data[2] ‖ change[3]?).
 
 **Royalty UTXO owner semantics:**
 
@@ -511,14 +511,15 @@ In both cases, royalty UTXO inherits all other tail fields from the source UTXO 
 **Unlocking:**
 
 ```
-[frozen_body_bytes (~700b)]    ← NEW: Frozen template body, hash-verified on-chain (§5.5.1)
+[frozen_body_bytes (~700b)]    ← Frozen template body, hash-verified on-chain (§5.5.1)
 [frozen_output_tuple (amount=my_amount, owner=my_owner, new_depth=my_depth, body_marker=0xfeff)]
-[null-data?]
 [funding_outpoint]
 [preimage]
 [OP_3]                         path_id = 3
 [freezeAuth_sig] [freezeAuth_pubkey]  or MPKH form
 ```
+
+**Normative: null-data and change outputs are DISALLOWED on freeze (Gap 4.3 closure).** The tx produced by freeze path consists of exactly one Frozen output plus optional funding/change handled externally. Any null-data or extra outputs beyond output[0] fail hashOutputs byte-exact reconstruction. Rationale: freeze is an authority operation with no audit-message use case requiring null-data, and change can be absorbed by the funding input's own P2PKH output outside the BNTP covenant scope.
 
 **Script verifies:**
 
@@ -540,17 +541,18 @@ In both cases, royalty UTXO inherits all other tail fields from the source UTXO 
 
 ```
 [normal_output_tuple (amount=my_amount, owner=new_owner, new_depth=0, body_marker=0x01ff)]
-[null-data?]
 [funding_outpoint]
 [preimage]
 [OP_4]                         path_id = 4
 [confiscAuth_sig] [confiscAuth_pubkey]  or MPKH form
 ```
 
+**Normative: null-data and change outputs DISALLOWED on confiscate (Gap 4.3 closure).** Same rationale as §9.4 freeze. Tx produces exactly one Normal output.
+
 **Script verifies:**
 
 1. `authorityFlags bit 1` set (confiscatable)
-2. Confiscation authority sig valid (PKH or MPKH per flag bit 3)
+2. Confiscation authority sig valid (identity via HASH160 match + explicit CHECKSIGVERIFY per §8.1; PKH or MPKH per flag bit 3)
 3. Exactly 1 Normal output with:
    - amount = my_amount (preserved)
    - owner = new_owner (authority chooses)
@@ -913,45 +915,46 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 
 ## 15. Resolved decisions (from user consultation)
 
-| #   | Decision                                | Outcome                                                                                                                                                                                                          |
-| --- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- | ----------------- | ------------------- | ------------------------------------------------------------------------------------- |
-| 1   | Swap architecture                       | External protocol layer, not in BNTP core                                                                                                                                                                        |
-| 2   | Issuer liveness model                   | Rolling attestation (D+B combo) via depth counter; subscription business model                                                                                                                                   |
-| 3   | Owner PKH/MPKH                          | Both supported (flag bit 5)                                                                                                                                                                                      |
-| 4   | Amount precision                        | uint128 (ETH-compat)                                                                                                                                                                                             |
-| 5   | Attestation economics                   | Flat royalty paid in token amount (not satoshis), out of UTXO's own value                                                                                                                                        |
-| 6   | Attestation content                     | Minimal: tokenId + thisOutpoint + issuerPubkey (option A)                                                                                                                                                        |
-| 7   | On-chain freshness enforcement          | Off-chain advisory only (option A), no CLTV                                                                                                                                                                      |
-| 8   | Authority paths vs attestation          | Authority sig sufficient, no attestation required on freeze/confiscate (option B)                                                                                                                                |
-| 9   | Issue attestation                       | Required (option B) — for uniformity                                                                                                                                                                             |
-| 10  | OptionalData continuity                 | Preserved byte-exact (option A)                                                                                                                                                                                  |
-| 11  | Attestation revocation                  | No separate mechanism; use confiscation if issuer mis-attested                                                                                                                                                   |
-| 12  | Naming                                  | BNTP (continuation of v1 research, not new protocol)                                                                                                                                                             |
-| 13  | `max_input_depth` sync on merge         | Free push + collective upper-bound enforcement. Over-reporting = self-harm, acceptable. See §9.2.1.                                                                                                              |
-| 14  | Issuer MPKH royalty owner               | royalty UTXO `owner = issuerPkh` with owner-MPKH flag bit 5 set for MPKH-gated spend. §9.3.                                                                                                                      |
-| 15  | Frozen body cross-template verification | Option β: embed 32b SHA256(Frozen_body) as constant in Normal. §5.5 body hash manifest.                                                                                                                          |
-| 16  | Tail layout                             | **111b** fixed, no `redemptionPkh`. Redeem collapsed into flex-transfer. §5.2, §9.6.                                                                                                                             |
-| 17  | Contract amount location                | In Contract tail as uint128 (mirrors Normal tail layout). §9.9.1.                                                                                                                                                |
-| 18  | uint128 vs ScriptNum arithmetic         | Storage format uint128; runtime cap ~int63 (9.2 × 10¹⁸). SDK validates. §9.11.                                                                                                                                   |
-| 19  | Body hash manifest pattern              | Accepted as WHITELIST replacement. 32b per cross-reference, not 128b block. §5.5.                                                                                                                                |
-| 20  | G5 gate target                          | Revised from ~2000b to ~2500b per Phase 0 pseudo-ASM validation. §11.1.                                                                                                                                          |
-| 21  | Depth overflow handling                 | **A: saturate at 65535.** `new_depth = min(max_input_depth + 1, 65535)`. §9.2 rule 10.                                                                                                                           |
-| 22  | `amounts_in_array` length               | **A: derive from outpoints count.** `                                                                                                                                                                            | amounts_in_array | == N × 16`, N = ` | all_input_outpoints | /36`. §9.2 rule 6.                                                                    |
-| 23  | Input layout contiguity                 | **A: BNTP inputs [0..N-1], funding at N.** Bound via `hashPrevouts` concatenation. §9.2 rule 2.                                                                                                                  |
-| 24  | Null-data canonical encoding            | **A': force direct-push minimal** for all fields ≤ 75 bytes (32, 36, 33). Saves ~3b/tx vs forcing OP_PUSHDATA1. §7.2.1.                                                                                          |
-| 25  | Max N bound on flex-transfer            | **B': N ≤ 32.** Compromise between expressiveness (consolidate 32 in one tx) and worst-case unlocking (~1.9 KB). §9.2 rule 7.                                                                                    |
-| 26  | Deploy-time hash verification           | **A: SDK tool (Phase 1 deliverable).** Compiles bodies, verifies cross-template constants match, publishes manifest. §14.                                                                                        |
-| 27  | Cross-template body (Normal↔Frozen)     | **Hash + unlocking push.** Source embeds 32b hash; unlocking pushes target body (~700b freeze / ~2500b unfreeze), locking verifies SHA256 match. Rare paths → unlocking overhead acceptable. §5.5.1, §9.4, §9.7. |
-| 28  | Cross-template body (Contract→Normal)   | **Inline Normal body constant.** Contract body ≈3100b (one-shot mint). Issue unlocking stays small instead of `N × 2500b`. §5.5.2, §9.9, §9.9.1.                                                                 |
-| 29  | Explicit PKH owner CHECKSIGVERIFY       | **Required.** Identity (HASH160 match) + authorization (CHECKSIGVERIFY) are independent; both mandatory. Covenant CHECKSIG is preimage-auth only, not owner-auth. +~5b PREFIX. §8.1.                             |
-| 30  | Explicit `M` push in flex-transfer      | **Required.** M ∈ [1,4] pushed as ScriptNum before output_tuples. Avoids fragile OP_DEPTH-based derivation. +~3b body. §9.2.                                                                                     |
-| 31  | Consensus-rules dependency              | **BSV post-Genesis required.** Normal body exceeds pre-Genesis opcode/stack-element limits. SDK gates deploys to post-Genesis networks. §13.6.                                                                   |
-| 32  | `body_before_tail` walk direction       | **Forward walk from start of scriptCode.** Deployment-time-known offset (`                                                                                                                                       | PREFIX           | +                 | SUFFIX              | +2`) locates OP_RETURN. Backward scan rejected (optionalData may contain `0x6a`). §5. |
-| 33  | `output_tuple` field encoding           | **Raw bytes, no push-opcode length prefix.** Locking script reconstructs the push prefix (`14` for 20b PKH, `4c XX` for MPKH preimage) on-chain during candidate output assembly. §9.2.                          |
-
----
-
-## 16. Open questions (Phase 1+)
+| #   | Decision                                | Outcome                                                                                                                                                                                                                        |
+| --- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------- | ----------------- | ------------------- | ------------------------------------------------------------------------------------- |
+| 1   | Swap architecture                       | External protocol layer, not in BNTP core                                                                                                                                                                                      |
+| 2   | Issuer liveness model                   | Rolling attestation (D+B combo) via depth counter; subscription business model                                                                                                                                                 |
+| 3   | Owner PKH/MPKH                          | Both supported (flag bit 5)                                                                                                                                                                                                    |
+| 4   | Amount precision                        | uint128 (ETH-compat)                                                                                                                                                                                                           |
+| 5   | Attestation economics                   | Flat royalty paid in token amount (not satoshis), out of UTXO's own value                                                                                                                                                      |
+| 6   | Attestation content                     | Minimal: tokenId + thisOutpoint + issuerPubkey (option A)                                                                                                                                                                      |
+| 7   | On-chain freshness enforcement          | Off-chain advisory only (option A), no CLTV                                                                                                                                                                                    |
+| 8   | Authority paths vs attestation          | Authority sig sufficient, no attestation required on freeze/confiscate (option B)                                                                                                                                              |
+| 9   | Issue attestation                       | Required (option B) — for uniformity                                                                                                                                                                                           |
+| 10  | OptionalData continuity                 | Preserved byte-exact (option A)                                                                                                                                                                                                |
+| 11  | Attestation revocation                  | No separate mechanism; use confiscation if issuer mis-attested                                                                                                                                                                 |
+| 12  | Naming                                  | BNTP (continuation of v1 research, not new protocol)                                                                                                                                                                           |
+| 13  | `max_input_depth` sync on merge         | Free push + collective upper-bound enforcement. Over-reporting = self-harm, acceptable. See §9.2.1.                                                                                                                            |
+| 14  | Issuer MPKH royalty owner               | royalty UTXO `owner = issuerPkh` with owner-MPKH flag bit 5 set for MPKH-gated spend. §9.3.                                                                                                                                    |
+| 15  | Frozen body cross-template verification | Option β: embed 32b SHA256(Frozen_body) as constant in Normal. §5.5 body hash manifest.                                                                                                                                        |
+| 16  | Tail layout                             | **111b** fixed, no `redemptionPkh`. Redeem collapsed into flex-transfer. §5.2, §9.6.                                                                                                                                           |
+| 17  | Contract amount location                | In Contract tail as uint128 (mirrors Normal tail layout). §9.9.1.                                                                                                                                                              |
+| 18  | uint128 vs ScriptNum arithmetic         | Storage format uint128; runtime cap ~int63 (9.2 × 10¹⁸). SDK validates. §9.11.                                                                                                                                                 |
+| 19  | Body hash manifest pattern              | Accepted as WHITELIST replacement. 32b per cross-reference, not 128b block. §5.5.                                                                                                                                              |
+| 20  | G5 gate target                          | Revised from ~2000b to ~2500b per Phase 0 pseudo-ASM validation. §11.1.                                                                                                                                                        |
+| 21  | Depth overflow handling                 | **A: saturate at 65535.** `new_depth = min(max_input_depth + 1, 65535)`. §9.2 rule 10.                                                                                                                                         |
+| 22  | `amounts_in_array` length               | **A: derive from outpoints count.** `                                                                                                                                                                                          | amounts_in_array | == N × 16`, N = ` | all_input_outpoints | /36`. §9.2 rule 6.                                                                    |
+| 23  | Input layout contiguity                 | **A: BNTP inputs [0..N-1], funding at N.** Bound via `hashPrevouts` concatenation. §9.2 rule 2.                                                                                                                                |
+| 24  | Null-data canonical encoding            | **A': force direct-push minimal** for all fields ≤ 75 bytes (32, 36, 33). Saves ~3b/tx vs forcing OP_PUSHDATA1. §7.2.1.                                                                                                        |
+| 25  | Max N bound on flex-transfer            | **B': N ≤ 32.** Compromise between expressiveness (consolidate 32 in one tx) and worst-case unlocking (~1.9 KB). §9.2 rule 7.                                                                                                  |
+| 26  | Deploy-time hash verification           | **A: SDK tool (Phase 1 deliverable).** Compiles bodies, verifies cross-template constants match, publishes manifest. §14.                                                                                                      |
+| 27  | Cross-template body (Normal↔Frozen)     | **Hash + unlocking push.** Source embeds 32b hash; unlocking pushes target body (~700b freeze / ~2500b unfreeze), locking verifies SHA256 match. Rare paths → unlocking overhead acceptable. §5.5.1, §9.4, §9.7.               |
+| 28  | Cross-template body (Contract→Normal)   | **Inline Normal body constant.** Contract body ≈3100b (one-shot mint). Issue unlocking stays small instead of `N × 2500b`. §5.5.2, §9.9, §9.9.1.                                                                               |
+| 29  | Explicit PKH owner CHECKSIGVERIFY       | **Required.** Identity (HASH160 match) + authorization (CHECKSIGVERIFY) are independent; both mandatory. Covenant CHECKSIG is preimage-auth only, not owner-auth. +~5b PREFIX. §8.1.                                           |
+| 30  | Explicit `M` push in flex-transfer      | **Required.** M ∈ [1,4] pushed as ScriptNum before output_tuples. Avoids fragile OP_DEPTH-based derivation. +~3b body. §9.2.                                                                                                   |
+| 31  | Consensus-rules dependency              | **BSV post-Genesis required.** Normal body exceeds pre-Genesis opcode/stack-element limits. SDK gates deploys to post-Genesis networks. §13.6.                                                                                 |
+| 32  | `body_before_tail` walk direction       | **Forward walk from start of scriptCode.** Deployment-time-known offset (`                                                                                                                                                     | PREFIX           | +                 | SUFFIX              | +2`) locates OP_RETURN. Backward scan rejected (optionalData may contain `0x6a`). §5. |
+| 33  | `output_tuple` field encoding           | **Raw bytes, no push-opcode length prefix.** Locking script reconstructs the push prefix (`14` for 20b PKH, `4c XX` for MPKH preimage) on-chain during candidate output assembly. §9.2.                                        |
+| 34  | MPKH issuer on refresh                  | **Required in v2.0 (Gap 4.1).** Path 2 locking branches on `authorityFlags bit 4`: PKH → HASH160+CHECKSIGVERIFY; MPKH → HASH160(preimage)+CHECKMULTISIGVERIFY. +~75b path 2. §9.3.                                             |
+| 35  | Null-data index on refresh              | **Index 2 is normative (Gap 4.2).** Output[0]=refreshed, [1]=royalty, [2]=null-data. Locking parses at fixed offset; SDK emits at index 2. §9.3.                                                                               |
+| 36  | Null-data / change on freeze/confiscate | **Disallowed (Gap 4.3).** Exactly 1 Normal/Frozen output. No null-data, no change. Funding handled externally. §9.4, §9.5.                                                                                                     |
+| 37  | Change output on refresh                | **Optional (Gap 4.4).** If `change_script_bytes` non-empty in unlocking, locking appends P2PKH-style change at output index 3. +~30b path 2. §9.3.                                                                             |
+| 38  | Path 1 FD-only varint retroactive opt   | **Apply (A.2.5).** A.2 showed candidate locking scripts always land in `[0xFD .. 0xFFFF]` range; retrofitting path 1 output reconstruction saves ~120b. Net impact with decisions #34+#37: body 2587 + 75 + 30 − 120 = ~2572b. |
 
 1. **Royalty minimum** — protocol enforces `≥ 1`, actual minimum is issuer policy. Should SDK have default guidance for depth-scaled pricing?
 2. **Null-data at issue (path 6)** — position of attestation null-data output when there are N token outputs. Simplest: always at index N. But varies with tx structure. Lock normative in Phase 1 Contract pseudo-ASM.
@@ -978,5 +981,6 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 - **2026-04-18** — Initial draft of BNTP v2. Pivot from v1 after full-tx footprint analysis showed v1 did not strictly dominate DSTAS. v2 redefines success as "solve STAS pains" not "smaller footprint". Swaps external, amount-in-tail, issuer attestation via depth-based rolling model. 12 design questions resolved with user input (see §15).
 - **2026-04-18** — Pseudo-ASM validation (opus) measured Normal body at **2461b** — low in PIVOT band vs initial ≤2000b target. Pain-resolution analysis (sonnet) scored BNTP v2 at 61/105 vs DSTAS 26.5/105 weighted (merge + B2G dominate, adoption friction -1). User ratified 8 additional design decisions + 3 SPEC AMENDMENT REQUESTs resolving pseudo-ASM OPEN QUESTIONs. Spec updated: §5.5 body hash manifest (replaces whitelist commitment), §9.2.1 max_input_depth collective enforcement, §9.3 MPKH issuer royalty owner, §9.6 redeem as flex-transfer (no dedicated path), §9.9.1 Contract tail with amount field, §9.11 uint128-vs-ScriptNum runtime cap, §11.1 G5 gate revised to ≤2500b. Verdict: **PASS under revised gate**. Proceed to Phase 1 planning.
 - **2026-04-18** — Security / workflow review closed 6 spec gaps (decisions #21-#26, §15): depth overflow saturation (§9.2), `amounts_in_array` length derived from outpoints count (§9.2), input-layout contiguity rule BNTP inputs [0..N-1] + funding at N (§9.2), null-data canonical direct-push-minimal encoding (§7.2.1), max flex-transfer fan-in `N ≤ 32` (§9.2), and SDK deploy-time template hash verification tool as Phase 1 deliverable (§14). On-chain body impact: ~+35b added via extra checks → estimated Normal body ≈ **2496b**, still PASS under revised G5 gate (≤ 2500b) — edge case, exactly at boundary. Gap 4 is a **decrease** of ~3b per null-data tx (direct push < PUSHDATA1).
+- **2026-04-18** — **A.2 real ASM completion + spec amendments** (`BNTP_V2_NORMAL_TEMPLATE_A2_REPORT.md`, delegated opus agent): paths 2 (refresh), 3 (freeze), 4 (confiscate) implemented. Full Normal body = **2587b PASS** (13b under G5 ceiling). A.2 agent discovered FD-only varint optimization saving ~160b across A.2 and retroactively applicable to A.1.1 for another ~120b. Surfaced 4 spec gaps; user ratified all 5 new decisions (#34-#38): (34) MPKH issuer on refresh normative per flag bit 4, +~75b; (35) null-data at output index 2 normative; (36) null-data and change disallowed on freeze/confiscate (simplest UX, no authority-op use case); (37) change output at index 3 optional on refresh, +~30b (UX: enables standard coin-selection); (38) retroactive FD-varint optimization on path 1 scheduled for A.2.5 agent round. Projected post-A.2.5 body: ~2572b PASS with ~28b margin. Full feature parity with spec (MPKH issuer on refresh, standard-UX change output).
 - **2026-04-18** — **A.1.1 real ASM measurement** (`BNTP_V2_NORMAL_TEMPLATE_A1_1_REPORT.md`, artifact `src/bntp/v2/templates/normal-body.ts`): Normal PREFIX + flex-transfer SUFFIX compiled to **1901 bytes** via opus agent. Verdict: **PASS** (~37% under G5 ceiling 2600b, ~22% under pseudo-ASM claim 2461b). A.1.0 audit was asymmetrically miscalibrated: too pessimistic on PREFIX (preimage parse 121b vs predicted 180-300b, tail cache 164b in audit mid-range), too optimistic on output reconstruction (620b vs predicted 360-440b). Closed 2 new spec gaps surfaced during real ASM writing (decisions #32-#33, §15): (32) `body_before_tail` walk direction = forward from scriptCode start via deployment-time offset §5; (33) `output_tuple` field encoding = raw bytes, locking script reconstructs push prefixes on-chain §9.2. Also documented implementation detail for decision #21 depth saturation via explicit `OP_GREATERTHAN OP_IF` branch §9.2. A.2 remaining budget: ~700b slack (audit projects path 2+3+4 at 810-920b — tight, near PIVOT band). DSTAS finding: confirmed high-confidence that DSTAS PKH owner-auth relies solely on covenant CHECKSIG (no separate owner-sig), suggesting dormant DSTAS vulnerability — filed for separate investigation, does not block BNTP v2.
 - **2026-04-18** — **A.1.0 pseudo-ASM audit** (`BNTP_V2_NORMAL_TEMPLATE_AUDIT.md`) closed 5 additional decisions (#27-#31): (27) cross-template body for rare paths via hash + unlocking-push (Normal↔Frozen) §5.5.1; (28) Contract inlines Normal body as constant (§5.5.2) — Contract body grows 500b → ~3100b but saves N×2500b in issue unlocking; (29) explicit PKH owner CHECKSIGVERIFY separate from covenant CHECKSIG §8.1; (30) explicit `M` (output count) push in flex-transfer unlocking §9.2; (31) BSV post-Genesis consensus requirement normative §13.6. Unlocking sizes revised: freeze ~960b, unfreeze/confisc-from-Frozen ~2760b (due to target body push). Normal body projection bumped 2496b → **~2550-2600b** (upper PASS band). Per-UTXO comparison to DSTAS adjusted: **−12%** Normal (was −15%), Frozen **−73%** (unchanged), Contract no longer per-UTXO-comparable (one-shot). Spec now frozen for A.1.1 real ASM writing.

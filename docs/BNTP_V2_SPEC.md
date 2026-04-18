@@ -15,7 +15,7 @@
 1. **Solve STAS merge pain.** Token amount lives in a tail field, not in satoshis. Unified `flex-transfer` path accepts N inputs → M outputs with on-script conservation. "Pay X from UTXO of value Y" requires one tx regardless of Y vs X relationship.
 2. **Solve STAS back-to-genesis pain for swap/DEX use cases.** Issuer attestation mechanism gives wallets O(1) verification of UTXO legitimacy when attestation is fresh. Depth counter tracks freshness; rolling refresh is the recovery path.
 3. **Trust-flexible.** Issuer can be PKH single-sig or MPKH threshold-sig. Owner, freeze authority, confiscation authority all independently configurable as PKH or MPKH.
-4. **Compliance-capable.** Freeze/confiscation/redeem remain first-class authority paths. ETH-decimal compatibility via uint128 amount field.
+4. **Compliance-capable.** Freeze and confiscation remain first-class authority paths. Redeem is not a dedicated path — it is a flex-transfer to issuer-owned address; issuer handles off-chain redemption. ETH-decimal compatibility via uint128 amount field (storage format; script arithmetic capped at ScriptNum int63 per §9.11).
 5. **Simple state space.** Two spendable templates (Normal, Frozen), no swap-specific templates, no whitelist commitment scheme.
 
 ### Non-goals (v2)
@@ -48,11 +48,11 @@
 
 Series v2 contains **2 deployable token templates** + 1 issuance template:
 
-| #   | Template   | action_data | Role                                                  | Spent to              | Est. body       |
-| --- | ---------- | ----------- | ----------------------------------------------------- | --------------------- | --------------- |
-| 0   | `Contract` | `OP_0`      | Pre-issuance reserve                                  | Normal × N (issue)    | ~500b           |
-| 1   | `Normal`   | `OP_0`      | Spendable token, all owner + authority + issuer paths | Normal, Frozen, P2PKH | ~2000b (target) |
-| 2   | `Frozen`   | `OP_2`      | Frozen token                                          | Normal                | ~600b           |
+| #   | Template   | action_data | Role                                                  | Spent to              | Est. body                                                                      |
+| --- | ---------- | ----------- | ----------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------ |
+| 0   | `Contract` | `OP_0`      | Pre-issuance reserve                                  | Normal × N (issue)    | ~500b                                                                          |
+| 1   | `Normal`   | `OP_0`      | Spendable token, all owner + authority + issuer paths | Normal, Frozen, P2PKH | ~2500b (target, revised from initial ~2000b per Phase 0 pseudo-ASM validation) |
+| 2   | `Frozen`   | `OP_2`      | Frozen token                                          | Normal                | ~600b                                                                          |
 
 No whitelist commitment. No seriesId. No SwapReady. No NormalSwapOnRamp. No anchor/follower pattern.
 
@@ -80,8 +80,10 @@ Normal
   ├─(flex-transfer, owner sig)─────► Normal × M          [N→M, amounts conserved, depth +=1]
   ├─(refresh, owner sig + issuer attestation)─► Normal × 2  [user's refreshed + issuer royalty; both depth = 0]
   ├─(freeze, freezeAuth sig)────────► Frozen × 1         [depth carried forward]
-  ├─(confiscate, confiscAuth sig)───► Normal × 1         [new owner, depth reset to 0]
-  └─(redeem, issuer sig)────────────► P2PKH + optional Normal × 0..3  [remainders keep depth]
+  └─(confiscate, confiscAuth sig)───► Normal × 1         [new owner, depth reset to 0]
+
+  (no dedicated redeem path; redeem is owner-initiated flex-transfer
+   to issuer-owned address; issuer handles off-chain redemption)
 
 Frozen
   ├─(unfreeze, freezeAuth sig)──────► Normal × 1         [same depth]
@@ -90,8 +92,8 @@ Frozen
 
 ### 4.2 Transition rules
 
-1. **Flex-transfer is the universal owner path.** N inputs → M outputs where N ≥ 1, M ∈ [1, 4]. All inputs must share `tokenId`. Amounts conserved: `Σ input_amounts == Σ output_amounts`. Each output's `attestation_depth = input_depth + 1` (uniform max if inputs have different depths; enforced in script).
-2. **Depth propagation:** on merge-like flex-transfer (multiple inputs), the output's depth = max(input depths) + 1. This is conservative — the token's "freshness" is as old as the oldest constituent.
+1. **Flex-transfer is the universal owner path.** N inputs → M outputs where N ≥ 1, M ∈ [1, 4]. All inputs must share `tokenId`. Amounts conserved: `Σ input_amounts == Σ output_amounts`. Each output's `attestation_depth = max_input_depth + 1` where `max_input_depth` is a freely-pushed value collectively enforced by all input scripts (see §9.2.1).
+2. **Depth propagation:** on merge-like flex-transfer (multiple inputs), the output's depth = max(input depths) + 1. This is conservative — the token's "freshness" is as old as the oldest constituent. Over-reporting `max_input_depth` results in unnecessarily-stale output UTXO (self-harm for the spender); under-reporting fails some input's script and rejects the tx.
 3. **Refresh resets depth to 0.** Requires issuer attestation. Exactly 1 input → exactly 2 outputs (user's refreshed UTXO + issuer's royalty UTXO). Royalty amount is flexible (≥ 1); issuer rejects via off-chain policy if too small.
 4. **Confiscation resets depth to 0.** Rationale: confiscation implies authority has vetted the new owner; fresh attestation semantically holds.
 5. **Freeze preserves depth.** Frozen UTXO's depth equals the spent UTXO's depth.
@@ -171,6 +173,24 @@ v1 used whitelist commitment to enforce "closed forward state" — outputs must 
 
 Trade-off: BNTP v2 relies entirely on off-chain verification (trusted issuer PKH registry) for "is this token legitimate". Same trust model as DSTAS+attestation, but cheaper to verify on receipt.
 
+### 5.5 Body hash manifest (replaces whitelist commitment)
+
+When a template needs to verify that an output is of a specific other template (e.g., Normal's freeze path produces a Frozen output, must verify the output body shape), v1's approach was to embed a 128-byte WHITELIST block listing all template body hashes. v2 takes a lighter approach.
+
+Each template body has a canonical deployment-time hash: `h_X = SHA256(body_X)`. Other templates that need cross-template verification embed **only the specific 32-byte hash they reference**, not a full whitelist.
+
+For v2 spec, the cross-template references are:
+
+- `Normal` embeds `h_Frozen` (32b) — used on path 3 freeze to verify Frozen output shape
+- `Contract` embeds `h_Normal` (32b) — used on path 6 issue to verify all N outputs are Normal
+- `Frozen` embeds `h_Normal` (32b) — used on path 3 unfreeze to verify Normal output shape
+
+**Total cross-reference cost:** 32b × 3 references = 96b across the 3 templates (vs v1's 128b × 4 templates = 512b total).
+
+**Deployment manifest (not on-chain):** a separate document or repository file that lists all template hashes and their deployment addresses. Used by SDK/indexer to assemble the constants during template compilation. Off-chain artifact.
+
+**Security:** same as v1 whitelist. Hash preimage resistance on SHA-256 prevents forgery; byte-exact embedded hash prevents substitution.
+
 ---
 
 ## 6. tokenId derivation
@@ -200,8 +220,8 @@ Same known limitation as v1: issuer can lie about `genesisTxId` at issue time, p
 - ✅ `refresh` path (Normal path 2)
 - ✅ `issue` path (Contract path 6)
 - ❌ `flex-transfer` path (Normal path 1) — no issuer involvement
-- ❌ `freeze` / `unfreeze` / `confiscate` paths — authority sig suffices (per ответ #8)
-- ❌ `redeem` path — issuer sig alone (redeem doesn't need attestation, the redemption itself is already issuer-authorized)
+- ❌ `freeze` / `unfreeze` / `confiscate` paths — authority sig suffices (no issuer attestation)
+- ℹ️ `redeem` is not a dedicated path — owner does a flex-transfer to issuer-owned address; no issuer attestation at that moment (issuer handles off-chain payout afterwards)
 
 ### 7.2 Attestation format
 
@@ -298,7 +318,7 @@ Script:
 
 ### 8.3 Authority/issuer/owner cannot rotate
 
-Fields fixed at issuance. No rotation mechanism in v2 core. Rotation = off-chain (issuer publishes new issuerPkh under same public identity, old tokens retire via redeem, new issue under new pkh).
+Fields fixed at issuance. No rotation mechanism in v2 core. Rotation = off-chain (issuer publishes new issuerPkh under same public identity; users migrate by flex-transferring old tokens to issuer-redemption-address under old pkh, then receiving fresh tokens from new issuance under new pkh).
 
 ---
 
@@ -312,7 +332,7 @@ Unlocking always ends with:
 ... [preimage] [path_id: 1..6] [sig] [pubKey]
 ```
 
-Path_id per template:
+Path_id values are template-scoped (not global). Normal uses 1..4, Frozen uses 3..4, Contract uses 6. Value 5 is reserved (formerly redeem in early drafts; collapsed into flex-transfer per spec decision).
 
 | path_id | Normal        | Frozen     | Contract |
 | ------- | ------------- | ---------- | -------- |
@@ -320,7 +340,7 @@ Path_id per template:
 | 2       | refresh       | —          | —        |
 | 3       | freeze        | unfreeze   | —        |
 | 4       | confiscate    | confiscate | —        |
-| 5       | redeem        | —          | —        |
+| 5       | reserved      | —          | —        |
 | 6       | —             | —          | issue    |
 
 ### 9.2 Normal path 1 — flex-transfer
@@ -332,6 +352,7 @@ Path_id per template:
 [amounts_in_array (N × 16b)]
 [all_input_outpoints (N × 36b)]
 [selfPosition (1b, 0..N-1)]
+[max_input_depth (2b, uint16)]
 [null-data payload?]
 [funding_outpoint]
 [preimage]
@@ -346,17 +367,27 @@ Path_id per template:
 3. `all_input_outpoints[selfPosition] == my_outpoint` (from preimage)
 4. `amounts_in_array[selfPosition] == my_amount` (from scriptCode tail)
 5. `N ≥ 1`, `M ∈ [1, 4]`
-6. Each output[i] for i ∈ [0, M-1]:
+6. `my_depth ≤ max_input_depth` (each input verifies this slice of max — collective upper-bound enforcement; see §9.2.1)
+7. Each output[i] for i ∈ [0, M-1]:
    - Is a Normal UTXO (body_marker = 0x01ff)
    - Has same tokenId as this UTXO
    - Has same issuerPkh, authorityFlags, freezeAuthHash, confiscAuthHash, optionalData (byte-exact)
-   - `new_depth ≥ max(all input depths) + 1` (conservative; can be higher if user chooses)
+   - `new_depth == max_input_depth + 1` (enforced per output)
    - `new_depth ≤ 65535` (uint16 bound check, prevents overflow)
    - `amount ≥ 1` (anti-dust)
-7. `Σ amounts_in_array == Σ output_amounts` (conservation)
-8. `hashOutputs` in preimage matches reconstructed outputs
+8. `Σ amounts_in_array == Σ output_amounts` (conservation)
+9. `hashOutputs` in preimage matches reconstructed outputs
 
-**Note on depth propagation in merge-like transfers:** when N > 1 (merging), depths of input UTXOs may differ. Output depth takes max(inputs) + 1. Each input script verifies its own amount, not other inputs' depth. But output depth check uses the field pushed in output_tuples; each input script verifies this field against a pushed `max_input_depth` value. Max_input_depth binding to actual inputs is tricky — simplest approach: each input pushes its own depth in unlocking, script checks `my_depth ≤ max_input_depth pushed`, and output verifies `new_depth ≥ max_input_depth + 1`. All inputs together enforce max is accurate.
+#### 9.2.1 `max_input_depth` collective enforcement mechanism
+
+`max_input_depth` is pushed freely in unlocking (not hash-committed). Each input's script verifies `my_depth ≤ max_input_depth`. Since **every** input's script runs independently and enforces this check, the pushed value is guaranteed to be ≥ actual max of all input depths.
+
+**Attacker analysis:**
+
+- Over-reporting (push `max_input_depth` > actual max): output's `new_depth` becomes inflated. UTXO "ages faster" and sooner requires refresh. **This is self-harm for the spender** — no attack vector against others or against the protocol's integrity.
+- Under-reporting (push `max_input_depth` < actual max of some input): that input's script check `my_depth ≤ max_input_depth` fails → entire tx rejected.
+
+Over-reporting as self-harm is deemed acceptable. No separate per-input-depth hash commitment is needed, saving ~40-80b of unlocking script and ~20b of template body. See `BNTP_V2_TEMPLATE_NORMAL_ASM.md` §9 AMR #2 for original rationale.
 
 ### 9.3 Normal path 2 — refresh (with issuer attestation)
 
@@ -389,6 +420,13 @@ Path_id per template:
 7. Issuer `CHECKSIGVERIFY` against preimage — standard covenant sig. This binds all outputs (including null-data) to issuer's approval via SIGHASH_ALL.
 8. hashOutputs matches reconstruction
 
+**Royalty UTXO owner semantics:**
+
+- For PKH issuer (flag bit 4 = 0): royalty UTXO `owner = issuerPkh` (20b PKH). Issuer spends via standard single-sig path with owner flag bit 5 = 0.
+- For MPKH issuer (flag bit 4 = 1): royalty UTXO `owner = issuerPkh` (same 20b hash; hash of canonical MPKH preimage). Issuer spends via owner-MPKH path (owner flag bit 5 = 1 on royalty UTXO). Issuer must provide MPKH preimage + m signatures when spending. This means the royalty UTXO carries owner-MPKH semantics; no separate "issuer-spend PKH" is needed.
+
+In both cases, royalty UTXO inherits all other tail fields from the source UTXO (tokenId, issuerPkh, authority block, authorityFlags). `attestation_depth` is 0 (freshly attested at refresh time).
+
 ### 9.4 Normal path 3 — freeze
 
 **Unlocking:**
@@ -406,12 +444,13 @@ Path_id per template:
 
 1. `authorityFlags bit 0` set (freezable)
 2. Freeze authority sig valid (PKH or MPKH per flag bit 2)
-3. Exactly 1 Frozen output (body_marker = 0xfeff), with:
+3. Output body shape matches Frozen template: `SHA256(output.body) == h_Frozen` where `h_Frozen` is embedded as a 32-byte constant in the Normal template body (see §5.5 Body hash manifest)
+4. Exactly 1 Frozen output (body_marker = 0xfeff), with:
    - amount = my_amount
    - owner = my_owner (owner unchanged)
    - new_depth = my_depth (depth preserved)
    - All other tail fields preserved
-4. hashOutputs match
+5. hashOutputs match
 
 ### 9.5 Normal path 4 — confiscate
 
@@ -437,99 +476,25 @@ Path_id per template:
    - All other tail fields preserved
 4. hashOutputs match
 
-### 9.6 Normal path 5 — redeem
+### 9.6 Redeem — no dedicated path
 
-**Unlocking:**
+Redeem is **not** a dedicated spend path in BNTP v2. Owner who wants to redeem their token uses `flex-transfer` (§9.2) with the destination owner set to an issuer-controlled address. The issuer then handles off-chain redemption (fiat payout, asset unlock, etc.) via their custody procedures.
 
-```
-[P2PKH_output_satoshis]
-[remainder_tuples... (0..3 Normal UTXOs with same token)]
-[null-data?]
-[funding_outpoint]
-[preimage]
-[OP_5]                         path_id = 5
-[issuer_sig] [issuer_pubkey]   or MPKH form
-```
+**Rationale:**
 
-**Script verifies:**
+- DSTAS-style redeem (P2PKH output matching `redemptionPkh`) required satoshi=amount equivalence. BNTP v2's amount-in-tail decouples satoshis from token amount, making P2PKH-as-redemption-target semantically awkward (different currencies).
+- Multiple candidate mechanisms (amount-to-sat conversion rate, dedicated redemption address, issuer-verified destination) each added complexity and/or a new tail field, without providing capabilities beyond "flex-transfer + off-chain settlement".
+- Collapsing redeem into flex-transfer keeps the protocol surface smaller and the tail at 111 bytes (no `redemptionPkh`).
 
-1. Output 0 = P2PKH with hash = `redemptionPkh` — wait, v2 has no `redemptionPkh` in tail. Need to add it, OR redeem goes to issuerPkh, OR out-of-band mechanism.
+**User workflow:**
 
-**Design decision needed — TODO:** how does redeem work without redemptionPkh?
+1. User initiates `flex-transfer` with: inputs = own Normal UTXO(s), output[0].owner = issuer-redemption-address (issuer publishes this address off-chain).
+2. Issuer sees on-chain transfer (via indexer or direct submission), verifies amount and tokenId.
+3. Issuer triggers off-chain payout (bank wire, stablecoin bridge, asset release, etc.).
 
-Options:
+**Trust model:** identical to DSTAS redeem — user trusts issuer to honor redemption. No on-chain enforcement of redemption execution; that is inherent to any asset-backed token.
 
-- Option A: add `redemptionPkh` as 6th tail field (20b, fixed tail becomes 131b)
-- Option B: redeem goes to `issuerPkh` (reuse issuer field as redemption target)
-- Option C: redemption address pushed in unlocking, verified by issuer sig (issuer approves each redeem's destination)
-
-**Choosing Option B for simplicity** — issuer is already the entity that can redeem; using issuerPkh as redemption target is natural. If issuer wants a different redemption account, they use a different issuerPkh when minting that token.
-
-With Option B:
-
-1. Output 0 = P2PKH with hash = issuerPkh (for PKH issuer) or P2PKH with hash = issuerPkh (for MPKH issuer — P2PKH of the MPKH preimage hash; issuer uses MPKH to spend this P2PKH)
-
-Wait — MPKH issuer can't spend regular P2PKH since it's multisig. Use P2MPKH-style output or require issuer to supply conversion tx.
-
-**Simpler: Option B with constraint** — issuer must be PKH for tokens that support redeem. Or redeem output uses issuer's MPKH-P2MPKH format. Add a flag.
-
-**Actually simplest Option D:** keep v1's `redemptionPkh` field — 20b, always PKH. Separate from issuer. Add back to tail.
-
-Updated tail (v2 revised):
-
-```
-tokenId           32b
-issuerPkh         20b
-redemptionPkh     20b  ← re-added for redeem
-amount            16b
-authorityFlags     1b
-freezeAuthHash    20b
-confiscAuthHash   20b
-attestation_depth  2b
-optionalData    variable
-Total fixed: 131 bytes
-```
-
-OK reverting to **131b tail** (still smaller than v1's 145b by removing seriesId 32b and adding nothing else).
-
-**Script verifies (revised):**
-
-1. Output 0 = P2PKH with hash = `this.redemptionPkh`
-2. Outputs 1..R (R ∈ [0, 3]) = Normal UTXOs with:
-   - Same tokenId
-   - amount ≥ 1
-   - depth = my_depth (carried forward)
-   - Other tail fields preserved
-3. `Σ (P2PKH.satoshis + Σ Normal.amounts) == ???` — wait, P2PKH uses satoshis, Normal uses amount. These are different currencies.
-
-**Actually for v2, redeem meaning clarification:**
-
-In DSTAS, satoshis = amount, so redeeming 100 tokens = sending 100 satoshis to redemptionPkh. Units consistent.
-
-In BNTP v2, amount is separate from satoshis. How does "redeem" translate?
-
-Options:
-
-- Option α: P2PKH output gets `redemption_satoshi_per_token * amount` — requires rate in tail or pushed by issuer
-- Option β: P2PKH output gets `amount` as satoshis — 1:1 token-to-sat redemption rate
-- Option γ: Redeem produces ONLY Normal UTXOs going to issuer (issuer does off-chain redemption)
-
-**Choosing Option γ (simplest on-chain):**
-
-Redeem = "transfer all token amount to issuer; issuer handles off-chain redemption". On-chain: flex-transfer from user → issuer's owner. Then issuer does P2PKH burn themselves later.
-
-This collapses redeem into flex-transfer with issuer-as-destination owner. **No separate redeem path needed!**
-
-Simplification: remove `redemptionPkh` from tail (back to 111b), remove redeem as path. User who wants to redeem just flex-transfers to issuer's owner address. Issuer does off-chain payout.
-
-**This further simplifies protocol.**
-
-Revised v2:
-
-- Tail: 111b (no redemptionPkh)
-- Normal paths: 1 (flex-transfer), 2 (refresh), 3 (freeze), 4 (confiscate) — **4 paths**
-- Frozen paths: 3 (unfreeze), 4 (confiscate)
-- Contract paths: 5 (issue) or keep 6 for future-proofing? Let's say path 6 for issue to leave gaps.
+Path_id 5 is **reserved** (not used) so that future versions can re-add a dedicated redeem semantic without a path-id migration.
 
 ### 9.7 Frozen path 3 — unfreeze
 
@@ -557,26 +522,65 @@ Confiscation from Frozen. Same as Normal confiscate but source is Frozen.
 **Script verifies:**
 
 1. Issuer sig valid (PKH or MPKH per flag bit 4)
-2. All N outputs are Normal (body_marker = 0x01ff)
-3. All N outputs share `tokenId = SHA256(genesisTxId ‖ contractVout ‖ issuerPkh)` where issuerPkh is from Contract's tail
-4. Tail fields (issuerPkh, authorityFlags, freezeAuthHash, confiscAuthHash, optionalData) match Contract's tail on every output
-5. All N outputs have `new_depth = 0` (fresh)
-6. `Σ output_amounts == Contract.reserve_amount` (Contract has an amount field too? Or uses satoshis for the reserve?)
+2. All N outputs are Normal: `SHA256(output[i].body) == h_Normal` where `h_Normal` is embedded as a 32-byte constant in Contract body (body hash manifest per §5.5)
+3. All N outputs have `body_marker = 0x01ff`
+4. All N outputs share `tokenId = SHA256(genesisTxId ‖ contractVout ‖ issuerPkh)` where `issuerPkh` is from Contract's tail
+5. Tail fields (issuerPkh, authorityFlags, freezeAuthHash, confiscAuthHash, optionalData) match Contract's tail on every output
+6. All N outputs have `new_depth = 0` (fresh)
+7. `Σ output_amounts == Contract.reserve_amount` (amount conservation — Contract's `amount` tail field set at mint time, enforces total supply)
+8. Null-data attestation at index N (after all output_tuples) — same format as refresh attestation (§7.2).
 
-**Contract's amount representation:**
+#### 9.9.1 Contract tail layout
 
-Option A: Contract has `amount` in tail (same structure as Normal). Mint tx stores this. Issue distributes.
-Option B: Contract uses satoshis for reserve (consensus-enforced conservation).
+Contract tail mirrors Normal's tail layout (111b fixed + optionalData), with one semantic difference: Contract's `amount` field is the **total reserve / max supply** for the token at issue time, not an individual holding. At issue, this total is distributed across N Normal outputs; Contract is consumed (single-spend UTXO, exists only between mint and issue).
 
-For symmetry with Normal and simplicity, Option A. Contract is structurally similar to Normal but with a different spend path.
+```
+tokenId           32 bytes   ← set at mint via SHA256(genesisTxId ‖ contractVout ‖ issuerPkh)
+issuerPkh         20 bytes   ← set by issuer at mint
+amount            16 bytes   ← total reserve / max supply (uint128, same ScriptNum cap §9.11)
+authorityFlags     1 byte    ← same structure as Normal
+freezeAuthHash    20 bytes
+confiscAuthHash   20 bytes
+attestation_depth  2 bytes   ← unused in Contract (always 0); kept for layout uniformity with Normal
+optionalData    variable
+```
 
-7. Null-data attestation at index N (after all output_tuples) — same format as refresh attestation.
+**Mint tx** (one-shot, creates Contract from funding): issuer publishes a tx with output[0] = Contract locking script with fully-populated tail including desired `amount`. No special on-chain validation at mint (it's just a P2-something → Contract output creation). The `amount` is issuer's declaration of supply.
+
+**Issue tx** (spends Contract, produces N Normal UTXOs): §9.9 path above. Script enforces distribution sums to `Contract.amount`. Once Contract is spent, no more tokens of this tokenId can be issued — fixed supply is structurally enforced.
+
+#### 9.9.2 Variable vs fixed supply
+
+v2 Contract supports fixed supply only (single-spend Contract consumed at first issue). Re-mintable supply would require a different template (e.g., ContractMintable that permits partial issue with leftover tracked in Contract UTXO's own amount field). Deferred to v2.1 if needed.
 
 ### 9.10 Why no anchor/follower
 
 v1 had anchor/follower pattern for merge-K because each input needed to reconstruct other inputs' prev txs to verify same-token invariant. In v2, conservation is verified via `amounts_in_array` pushed directly in unlocking and bound via `hashPrevouts`. Each input just checks its own slice of this array. No prev-tx reconstruction needed.
 
 Saving: ~500-1000b removed from merge logic vs v1's anchor/follower.
+
+### 9.11 Amount precision — uint128 storage, ScriptNum runtime cap
+
+The tail's `amount` field is **stored as uint128 (16 bytes, little-endian)** for ETH-decimal compatibility (e.g., tokens bridged from 18-decimal ETH representations need to round-trip through BNTP UTXOs).
+
+However, BSV Script's `OP_BIN2NUM` converts bytes to Script's internal `ScriptNum` type, which is a **signed integer up to ~int63** (9,223,372,036,854,775,807 ≈ 9.2 × 10¹⁸). Script-side arithmetic (amount conservation, anti-dust, sum/diff) operates on ScriptNum values.
+
+**Practical cap:** amount values in BNTP v2 MUST fit within int63 at the moment of any arithmetic operation. The uint128 storage format allows representing values up to 2¹²⁸ − 1, but v2 does not support chunked big-integer arithmetic in script (doing so would add ~200-400b to the template body for no meaningful production use case).
+
+**In practical terms:**
+
+- ≤ 9.2 × 10¹⁸ token units — fully supported ✅
+- > 9.2 × 10¹⁸ units — rejected at tx validation (script's BIN2NUM or arithmetic overflow)
+
+For context, 9.2 × 10¹⁸ ≈ 9.2 quintillion. For typical token use cases:
+
+- Stablecoin at 6 decimals: 9.2 trillion USD-equivalent — far beyond any realistic market cap
+- ETH at 18 decimals: 9.2 tokens — **may be too small** for mint supplies of high-volume tokens
+- Commodity at 8 decimals: 92 billion units — ample
+
+If a token issuance legitimately exceeds the int63 cap (e.g., bridging in all of ETH's 120M × 10¹⁸ wei supply), use a **smaller decimal base** in BNTP representation (e.g., 12 decimals instead of 18) and perform final-decimal normalization off-chain at bridging boundaries.
+
+SDK should validate issuance and transfer amounts against this cap and reject early (before constructing a tx that would fail validation). Spec ratifies the cap explicitly to avoid surprise rejections.
 
 ---
 
@@ -598,15 +602,22 @@ MPKH variants: issuer/owner/auth MPKH adds `OP_0 + m sigs + MPKH preimage` inste
 
 ## 11. Size estimates
 
-### 11.1 Template body budget
+### 11.1 Template body budget (revised per Phase 0 pseudo-ASM validation)
 
-| Template | PREFIX (common) | SUFFIX (path-specific) | Body marker | **Body total (target)** |
-| -------- | --------------- | ---------------------- | ----------- | ----------------------- |
-| Contract | ~300b           | ~200b                  | 2b          | **~500b**               |
-| Normal   | ~700b           | ~1300b                 | 2b          | **~2000b**              |
-| Frozen   | ~300b           | ~300b                  | 2b          | **~600b**               |
+G5 gate targets (revised from initial ~2000b draft):
 
-Targets. Actual sizes TBD after pseudo-ASM pass.
+- **PASS:** body ≤ 2500b
+- **PASS-with-margin:** 2500-2700b (minor optimization opportunities remaining)
+- **PIVOT:** 2700-3000b (feature cuts needed)
+- **ABORT:** > 3000b (design reconsideration)
+
+| Template | PREFIX (common) | SUFFIX (path-specific) | Body marker | **Body total (target)** | Pseudo-ASM (measured) |
+| -------- | --------------- | ---------------------- | ----------- | ----------------------- | --------------------- |
+| Contract | ~350b           | ~250b                  | 2b          | **~600b**               | TBD Phase 1           |
+| Normal   | ~830b           | ~1630b                 | 2b          | **~2500b**              | **2461b (PASS)**      |
+| Frozen   | ~350b           | ~350b                  | 2b          | **~700b**               | TBD Phase 1           |
+
+Normal measured at 2461b per `BNTP_V2_TEMPLATE_NORMAL_ASM.md`. PASS under revised gate.
 
 ### 11.2 Per-UTXO (owner 20b PKH, empty optionalData)
 
@@ -614,11 +625,11 @@ Fixed tail: 111b. Variable prefix: ~22b (owner push + action_data + OP_2DROP). B
 
 | State    | Body | Tail | Variable prefix | **Per-UTXO** | vs DSTAS (~3050b) |
 | -------- | ---- | ---- | --------------- | ------------ | ----------------- |
-| Normal   | 2000 | 111  | 22              | **~2133b**   | **−30%**          |
-| Frozen   | 600  | 111  | 22              | **~733b**    | **−76%**          |
-| Contract | 500  | 111  | 22              | **~633b**    | —                 |
+| Normal   | 2461 | 111  | 22              | **~2594b**   | **−15%**          |
+| Frozen   | 700  | 111  | 22              | **~833b**    | **−73%**          |
+| Contract | 600  | 111  | 22              | **~733b**    | —                 |
 
-**Normal ~30% smaller than DSTAS.** Not the primary goal, but useful side effect.
+**Normal ~15% smaller per-UTXO than DSTAS.** Primary wins remain on Frozen (−73%) and merge operations (see §11.4). Smaller-Normal is a secondary benefit, not the goal.
 
 ### 11.3 Unlocking sizes (examples, no MPKH)
 
@@ -763,31 +774,38 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 
 ## 15. Resolved decisions (from user consultation)
 
-| #   | Decision                       | Outcome                                                                           |
-| --- | ------------------------------ | --------------------------------------------------------------------------------- |
-| 1   | Swap architecture              | External protocol layer, not in BNTP core                                         |
-| 2   | Issuer liveness model          | Rolling attestation (D+B combo) via depth counter; subscription business model    |
-| 3   | Owner PKH/MPKH                 | Both supported (flag bit 5)                                                       |
-| 4   | Amount precision               | uint128 (ETH-compat)                                                              |
-| 5   | Attestation economics          | Flat royalty paid in token amount (not satoshis), out of UTXO's own value         |
-| 6   | Attestation content            | Minimal: tokenId + thisOutpoint + issuerPubkey (option A)                         |
-| 7   | On-chain freshness enforcement | Off-chain advisory only (option A), no CLTV                                       |
-| 8   | Authority paths vs attestation | Authority sig sufficient, no attestation required on freeze/confiscate (option B) |
-| 9   | Issue attestation              | Required (option B) — for uniformity                                              |
-| 10  | OptionalData continuity        | Preserved byte-exact (option A)                                                   |
-| 11  | Attestation revocation         | No separate mechanism; use confiscation if issuer mis-attested                    |
-| 12  | Naming                         | BNTP (continuation of v1 research, not new protocol)                              |
+| #   | Decision                                | Outcome                                                                                             |
+| --- | --------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| 1   | Swap architecture                       | External protocol layer, not in BNTP core                                                           |
+| 2   | Issuer liveness model                   | Rolling attestation (D+B combo) via depth counter; subscription business model                      |
+| 3   | Owner PKH/MPKH                          | Both supported (flag bit 5)                                                                         |
+| 4   | Amount precision                        | uint128 (ETH-compat)                                                                                |
+| 5   | Attestation economics                   | Flat royalty paid in token amount (not satoshis), out of UTXO's own value                           |
+| 6   | Attestation content                     | Minimal: tokenId + thisOutpoint + issuerPubkey (option A)                                           |
+| 7   | On-chain freshness enforcement          | Off-chain advisory only (option A), no CLTV                                                         |
+| 8   | Authority paths vs attestation          | Authority sig sufficient, no attestation required on freeze/confiscate (option B)                   |
+| 9   | Issue attestation                       | Required (option B) — for uniformity                                                                |
+| 10  | OptionalData continuity                 | Preserved byte-exact (option A)                                                                     |
+| 11  | Attestation revocation                  | No separate mechanism; use confiscation if issuer mis-attested                                      |
+| 12  | Naming                                  | BNTP (continuation of v1 research, not new protocol)                                                |
+| 13  | `max_input_depth` sync on merge         | Free push + collective upper-bound enforcement. Over-reporting = self-harm, acceptable. See §9.2.1. |
+| 14  | Issuer MPKH royalty owner               | royalty UTXO `owner = issuerPkh` with owner-MPKH flag bit 5 set for MPKH-gated spend. §9.3.         |
+| 15  | Frozen body cross-template verification | Option β: embed 32b SHA256(Frozen_body) as constant in Normal. §5.5 body hash manifest.             |
+| 16  | Tail layout                             | **111b** fixed, no `redemptionPkh`. Redeem collapsed into flex-transfer. §5.2, §9.6.                |
+| 17  | Contract amount location                | In Contract tail as uint128 (mirrors Normal tail layout). §9.9.1.                                   |
+| 18  | uint128 vs ScriptNum arithmetic         | Storage format uint128; runtime cap ~int63 (9.2 × 10¹⁸). SDK validates. §9.11.                      |
+| 19  | Body hash manifest pattern              | Accepted as WHITELIST replacement. 32b per cross-reference, not 128b block. §5.5.                   |
+| 20  | G5 gate target                          | Revised from ~2000b to ~2500b per Phase 0 pseudo-ASM validation. §11.1.                             |
 
 ---
 
 ## 16. Open questions (Phase 1+)
 
-1. **Depth propagation on merge-like flex-transfer** — §9.2 notes need for each input to push its own depth in unlocking + script verifies consistent max. Need concrete algorithm + attack analysis during pseudo-ASM.
-2. **Royalty minimum** — protocol enforces `≥ 1`, actual minimum is issuer policy. Should SDK have default guidance?
-3. **Redeem mechanism** — v2 drops dedicated redeem path in favor of flex-transfer to issuer. Is this acceptable? If redeem has legal/compliance distinctions, may need separate path back.
-4. **Contract amount** — §9.9 notes Contract has `amount` in tail. How is this set at mint? Issuer-specified during mint tx. TBD exact unlocking format for mint-contract tx.
-5. **Null-data at issue (path 6)** — position of attestation null-data output when there are N token outputs. Simplest: always at index N. But varies with tx structure. Lock normative.
-6. **OptionalData size limit** — reuse v1 limit (4096 bytes)?
+1. **Royalty minimum** — protocol enforces `≥ 1`, actual minimum is issuer policy. Should SDK have default guidance for depth-scaled pricing?
+2. **Null-data at issue (path 6)** — position of attestation null-data output when there are N token outputs. Simplest: always at index N. But varies with tx structure. Lock normative in Phase 1 Contract pseudo-ASM.
+3. **OptionalData size limit** — reuse v1 limit (4096 bytes)? Decision for Phase 1.
+4. **Deployment manifest format** — body hash manifest (§5.5) is off-chain artifact; file format / publication channel TBD for operational spec.
+5. **Issuer service reference implementation** — REST API for attestation, subscription batch signing, depth-scaled pricing. Phase 3-4 deliverable.
 
 ---
 
@@ -806,3 +824,4 @@ Deliverable: functional mint + pay + refresh. No freeze, no confiscate.
 ## 18. Change log
 
 - **2026-04-18** — Initial draft of BNTP v2. Pivot from v1 after full-tx footprint analysis showed v1 did not strictly dominate DSTAS. v2 redefines success as "solve STAS pains" not "smaller footprint". Swaps external, amount-in-tail, issuer attestation via depth-based rolling model. 12 design questions resolved with user input (see §15).
+- **2026-04-18** — Pseudo-ASM validation (opus) measured Normal body at **2461b** — low in PIVOT band vs initial ≤2000b target. Pain-resolution analysis (sonnet) scored BNTP v2 at 61/105 vs DSTAS 26.5/105 weighted (merge + B2G dominate, adoption friction -1). User ratified 8 additional design decisions + 3 SPEC AMENDMENT REQUESTs resolving pseudo-ASM OPEN QUESTIONs. Spec updated: §5.5 body hash manifest (replaces whitelist commitment), §9.2.1 max_input_depth collective enforcement, §9.3 MPKH issuer royalty owner, §9.6 redeem as flex-transfer (no dedicated path), §9.9.1 Contract tail with amount field, §9.11 uint128-vs-ScriptNum runtime cap, §11.1 G5 gate revised to ≤2500b. Verdict: **PASS under revised gate**. Proceed to Phase 1 planning.

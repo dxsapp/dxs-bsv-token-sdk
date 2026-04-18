@@ -284,6 +284,17 @@ Pivot если:
   - **Pain-resolution (sonnet):** BNTP v2 = 61/105 vs DSTAS = 26.5/105 (weighted, merge+B2G at 4× weight). Merge pain delta +4 (1→5, fully resolved). B2G pain delta +3 (1→4). Adoption friction regression -1 (3→2, due to issuer liveness dependency). Final recommendation: proceed to Phase 1.
   - **Pseudo-ASM (opus):** Normal body = 2461b vs target ≤2000b (G5 gate) — **PIVOT verdict** (landed low in 2300-2800b PIVOT band, 161b above PASS-with-margin). Major vs v1: −1593b (−39%) — savings from no whitelist, no anchor/follower, no redeem path. Flex-transfer alone: 731b (biggest single path). Amount conservation arithmetic +205b (slightly more than estimated). Recommended: accept PIVOT and revise G5 target to 2500b (SPEC AMENDMENT REQUEST #3), OR cut M≤2 / drop MPKH owner / uint64 to hit PASS.
   - **Net BNTP v2 verdict:** directionally correct (solves the right pains at reasonable cost), 39% smaller than v1 NormalBase, 20% per-UTXO smaller than DSTAS. 5 OPEN QUESTIONs and 3 SPEC AMRs to resolve before Phase 1 kick-off.
+- **2026-04-18** — **Post-validation spec cleanup.** User ratified 6 remaining OPEN QUESTIONs + 3 SPEC AMRs from pseudo-ASM agent:
+  - `max_input_depth` collective enforcement (free push + per-input upper-bound check; over-reporting = self-harm, acceptable) → §9.2.1
+  - Issuer MPKH royalty owner = issuerPkh with owner-MPKH flag set → §9.3 clarification
+  - Frozen body cross-template verification: embed 32b `h_Frozen` as constant in Normal → §5.5 body hash manifest
+  - Tail locked at 111b (no redemptionPkh); redeem collapsed into flex-transfer to issuer-owned address → §9.6 rewritten
+  - Contract has `amount` field in tail (uint128, mirrors Normal layout); single-spend Contract enforces fixed supply → §9.9.1
+  - uint128 storage format; runtime ScriptNum cap at ~int63 (9.2 × 10¹⁸); SDK validates → §9.11
+  - Body hash manifest pattern (32b per cross-reference) replaces v1's 128b whitelist block → §5.5
+  - `max_input_depth` semantics normative in §9.2.1
+  - G5 gate target revised from ~2000b to ~2500b (matches pseudo-ASM reality, features intact) → §11.1
+  - **Status: BNTP v2 spec cleanup complete. Normal body at 2461b = PASS under revised gate.** Spec ready for Phase 1 planning. All design ambiguities resolved.
 - **2026-04-17** — **Phase 0 executed** via wave package `docs/stream-tasks/bntp-phase-0-pseudo-asm-wave/`. Three parallel opus agents (S1 Normal pseudo-ASM, S2 whitelist proof, S3 anchor/follower algorithm). Results:
   - G1 (Normal body ≤ 2400b): **PIVOT** — actual ~4640b, optimized floor ~3600b. Budget was unrealistic.
   - G2 (whitelist soundness): **PASS** — 5/5 claims defended, 11 new surfaces enumerated 0 unmitigated, scheme formally sound (constant-function argument).

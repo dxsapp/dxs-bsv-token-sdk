@@ -157,73 +157,117 @@ export const PREIMAGE_PARSE_ASM = `
   OP_FROMALTSTACK OP_FROMALTSTACK OP_SWAP OP_TOALTSTACK OP_TOALTSTACK
 `;
 
-// §3.5 scriptCode tail extraction + cache (7 fields to altstack).
-// Tail layout is identical across Normal/Contract/Frozen per spec §5.2.
-export const TAIL_CACHE_ASM = `
-  OP_FROMALTSTACK
-  OP_DUP OP_TOALTSTACK
-  OP_SIZE OP_SWAP
-  OP_1 OP_SPLIT
-  00 OP_CAT OP_BIN2NUM
-  OP_DUP 4b OP_LESSTHANOREQUAL
-  OP_IF
-    OP_NIP OP_SWAP
-  OP_ELSE
-    OP_DUP 4c OP_NUMEQUAL
-    OP_IF
-      OP_DROP OP_DROP
-      OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM OP_SWAP
-    OP_ELSE
-      OP_DUP 4d OP_NUMEQUAL
-      OP_IF
-        OP_DROP OP_DROP
-        OP_2 OP_SPLIT OP_SWAP 0000 OP_CAT OP_BIN2NUM OP_SWAP
-      OP_ELSE
-        OP_DROP OP_DROP
-        OP_4 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP
-      OP_ENDIF
-    OP_ENDIF
-  OP_ENDIF
-  OP_SPLIT
-  OP_DUP OP_TOALTSTACK
-  OP_DROP
-  OP_1 OP_SPLIT OP_NIP
-  OP_1 OP_SPLIT OP_SWAP
-  00 OP_EQUALVERIFY
-  0000 0000 OP_CAT
-  OP_SPLIT
-  OP_SWAP OP_TOALTSTACK
-  OP_DUP OP_SIZE OP_NIP
-  OP_1 OP_SPLIT OP_NIP
-  6A OP_EQUALVERIFY
-  OP_DUP
-  20 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  10 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  OP_1 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_FROMALTSTACK OP_DROP
-  OP_FROMALTSTACK
-  OP_DUP OP_TOALTSTACK
-  OP_1 OP_SPLIT
-  OP_DROP
-  OP_1 OP_SPLIT
-  00 OP_CAT OP_BIN2NUM
-  OP_DUP 14 OP_NUMEQUAL
-  OP_IF
-    OP_DROP
-    14 OP_SPLIT
-    OP_SWAP OP_TOALTSTACK
-  OP_ELSE
+// §3.5 scriptCode tail extraction + cache (7 fields + optionalData + owner
+// pkh to altstack). Tail layout is identical across Normal/Contract/Frozen
+// per spec §5.2.
+//
+// -- Phase 1B Wave C.4 rewrite --------------------------------------------
+//
+// The prior TAIL_CACHE_ASM (flagged "NOT yet execution-verified" by its
+// original author) had several stack-order bugs. The first trace failure
+// was in the leading push-opcode dispatcher: after `OP_1 OP_SPLIT` the
+// stack is `[size, firstByte(1b), rest]` with `rest` on top, and the
+// subsequent `00 OP_CAT OP_BIN2NUM` was numifying `rest` (the 2000+ byte
+// tail) instead of `firstByte`. All three `OP_NUMEQUAL` dispatches
+// (0x4b/0x4c/0x4d) consequently failed, falling through to the `OP_4
+// OP_SPLIT` default branch, which tried to split a 2-byte scriptnum at
+// position 4 → "OP_SPLIT out of range".
+//
+// Additional stack-order errors in the subsequent field walk made the
+// block not worth patching incrementally. It is replaced with a simple,
+// position-based walk driven by a compile-time `prefixBeforeTailSize`
+// constant (passed by the caller — `normal-body.ts`, etc.).
+//
+// -- Preconditions --------------------------------------------------------
+// main stack top-down: [pubkey, sig, path_id, ...]
+// altstack top-down : [scriptCode, hashOutputs, thisOutpoint, hashPrevouts]
+//
+// -- scriptCode layout (spec §5.2) ---------------------------------------
+//   [0x14 <20b owner_pkh>]              // PKH owner direct push (21 bytes)
+//   [0x00 0x6d]                         // OP_0 action_data + OP_2DROP
+//   [body]                              // NORMAL/CONTRACT/FROZEN body bytes
+//   [0x6a]                              // OP_RETURN
+//   [32b tokenId][20b issuerPkh][16b amount][1b flags]
+//   [20b freezeAuthHash][20b confiscAuthHash][2b depth]
+//   [optionalData (variable, may be empty)]
+//
+// `prefixBeforeTailSize` = 21 + 2 + |body| + 1 = |body| + 24, counting
+// owner push (21b), OP_0 OP_2DROP (2b), body, OP_RETURN (1b). Tail starts
+// at this offset within scriptCode.
+//
+// -- Postconditions -------------------------------------------------------
+// main stack top-down: [pubkey, sig, path_id, ...]  (unchanged)
+// altstack top-down :
+//   [scriptCode,                         // preserved for downstream path
+//    optionalData, depth, confiscAuthHash, freezeAuthHash, authorityFlags,
+//    amount, issuerPkh, tokenId,         // 7 tail fields + optionalData,
+//                                        // top-most field = last-walked
+//    owner_pkh,                          // from variable prefix
+//    hashOutputs, thisOutpoint, hashPrevouts]  (from PREIMAGE_PARSE)
+//
+// -- Scope limitation ----------------------------------------------------
+// PKH owner only. MPKH owner (first byte 0x4c for PUSHDATA1) is rejected
+// via OP_EQUALVERIFY on the 0x14 marker — TODO for a follow-up wave.
+//
+// -- Byte cost -----------------------------------------------------------
+// This rewrite is larger than the broken original (~120b vs ~75b) because
+// it skips push-opcode dispatch in favor of a single compile-time offset.
+// Byte budget is secondary to correctness per task scope; the saved ~45b
+// of the original were ill-spent since the block never executed.
+export const tailCacheAsm = (prefixBeforeTailSize: number): string => {
+  // Encode prefixBeforeTailSize as a 2-byte little-endian push. Using a
+  // fixed-width 2-byte hex token keeps the compiled ASM length invariant
+  // in the value, which matters because `NORMAL_BODY_SIZE` in turn depends
+  // on this block's size — a 2-pass fixed-point compile converges trivially.
+  const lo = prefixBeforeTailSize & 0xff;
+  const hi = (prefixBeforeTailSize >> 8) & 0xff;
+  const hex = (
+    lo.toString(16).padStart(2, "0") + hi.toString(16).padStart(2, "0")
+  ).toLowerCase();
+  return `
+    OP_FROMALTSTACK
+    OP_DUP
+
+    ${hex}
+    OP_BIN2NUM
     OP_SPLIT
-    OP_SWAP OP_TOALTSTACK
-  OP_ENDIF
-  00 OP_EQUALVERIFY
-  OP_FROMALTSTACK OP_TOALTSTACK
-`;
+    OP_SWAP
+
+    OP_1 OP_SPLIT
+    OP_SWAP
+    00 OP_CAT OP_BIN2NUM
+    14 OP_NUMEQUALVERIFY
+
+    14 OP_SPLIT
+    OP_SWAP
+    OP_TOALTSTACK
+
+    OP_2 OP_SPLIT
+    OP_SWAP
+    006D OP_EQUALVERIFY
+
+    OP_SIZE OP_1SUB OP_SPLIT
+    OP_NIP
+    6A OP_EQUALVERIFY
+
+    20 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    14 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    10 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_1 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    14 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    14 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
+    OP_TOALTSTACK
+
+    OP_TOALTSTACK
+  `;
+};
+
+// Back-compat placeholder export. The caller MUST import `tailCacheAsm`
+// and pass the real prefixBeforeTailSize. This constant is kept only so
+// `normal-body.ts`' re-export line continues to typecheck; it produces
+// an invalid script if inlined directly (offset = 0).
+export const TAIL_CACHE_ASM = tailCacheAsm(0);
 
 // Output serialization helper — FD-only varint (candidate scripts always
 // land in [0xFD..0xFFFF] range per decision #38; single-branch saves ~120b

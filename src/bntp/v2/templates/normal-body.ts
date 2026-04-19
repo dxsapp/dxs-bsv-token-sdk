@@ -5,7 +5,7 @@ import {
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
   PREIMAGE_PARSE_ASM,
-  TAIL_CACHE_ASM,
+  tailCacheAsm,
   VARINT_SERIALIZE_ASM,
   authorityIdentityAsm,
 } from "./shared-prefix";
@@ -18,7 +18,6 @@ export {
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
   PREIMAGE_PARSE_ASM,
-  TAIL_CACHE_ASM,
   VARINT_SERIALIZE_ASM,
   authorityIdentityAsm,
 };
@@ -800,13 +799,22 @@ const DISPATCHER_MIDDLE_ASM = `
 // ---------------------------------------------------------------------------
 // Assemble NORMAL_BODY_ASM
 // ---------------------------------------------------------------------------
-export const NORMAL_BODY_ASM = `
+// `tailCacheAsm(prefixBeforeTailSize)` needs the offset from the start of the
+// compiled scriptCode to the start of the tail. For a PKH-owner locking
+// script that offset is `22 (owner push) + 2 (OP_0 OP_2DROP) + |body| + 1
+// (OP_RETURN)`. The `|body|` term depends recursively on `tailCacheAsm`'s
+// own compiled byte count — but `tailCacheAsm(N)` encodes N as a fixed-width
+// 2-byte little-endian push, so its compiled byte count is invariant in N.
+// That lets us compile once with an arbitrary placeholder, measure the body
+// size, and emit the final body in a single recompile. A trivial 1-step
+// fixed-point.
+const buildNormalBodyAsm = (prefixBeforeTailSize: number): string => `
   ${COVENANT_PREIMAGE_ROLL_ASM}
   ${COVENANT_S_PREAMBLE_ASM}
   ${COVENANT_TAIL_ASM}
   ${SIGHASH_CHECK_ASM}
   ${PREIMAGE_PARSE_ASM}
-  ${TAIL_CACHE_ASM}
+  ${tailCacheAsm(prefixBeforeTailSize)}
   ${OWNER_IDENTITY_ASM}
   ${DISPATCHER_HEADER_ASM}
   ${PATH1_HASHPREVOUTS_BIND_ASM}
@@ -821,6 +829,20 @@ export const NORMAL_BODY_ASM = `
   ${PATH1_HASHOUTPUTS_CLOSE_ASM}
   ${DISPATCHER_MIDDLE_ASM}
 `;
+
+// First pass: measure body size with any placeholder offset.
+const MEASUREMENT_BODY_BYTES = (() => {
+  const tail = asmToBytes(buildNormalBodyAsm(0));
+  return BODY_MARKER_BYTES.length + tail.length;
+})();
+
+// PKH owner prefix-before-tail = 0x14(1) + owner_pkh(20) + OP_0(1) + OP_2DROP(1)
+//   + body(MEASUREMENT_BODY_BYTES) + OP_RETURN(1) = |body| + 24.
+const PREFIX_BEFORE_TAIL_SIZE = MEASUREMENT_BODY_BYTES + 24;
+
+export const TAIL_CACHE_ASM = tailCacheAsm(PREFIX_BEFORE_TAIL_SIZE);
+
+export const NORMAL_BODY_ASM = buildNormalBodyAsm(PREFIX_BEFORE_TAIL_SIZE);
 
 /**
  * Compile NORMAL_BODY_ASM to raw bytes. Prepends the body-marker PUSHDATA1
@@ -837,6 +859,17 @@ export const compileNormalBody = (): Uint8Array => {
 
 export const NORMAL_BODY_BYTES: Uint8Array = compileNormalBody();
 export const NORMAL_BODY_SIZE: number = NORMAL_BODY_BYTES.length;
+
+// Invariant check: the measurement pass must match the final pass, since
+// `tailCacheAsm`'s compiled size is invariant in the offset value. A
+// violation indicates the ASM builder broke the fixed-width push assumption
+// (e.g., a value above 0x7FFF encoding with different semantics).
+if (NORMAL_BODY_SIZE !== MEASUREMENT_BODY_BYTES) {
+  throw new Error(
+    `BNTP v2 Normal body: tailCacheAsm compile size changed with offset. ` +
+      `Measured=${MEASUREMENT_BODY_BYTES}, final=${NORMAL_BODY_SIZE}.`,
+  );
+}
 
 /**
  * Per-section byte breakdown (for reporting). Each section is compiled in

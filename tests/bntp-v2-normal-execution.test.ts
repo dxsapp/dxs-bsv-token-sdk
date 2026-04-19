@@ -315,17 +315,15 @@ describe("BNTP v2 Normal template — flex-transfer execution (Phase 1B Wave C)"
       ),
     );
 
-    // Outcome is what it is — we assert the observed result so downstream can
-    // see it in jest output. If the script succeeds we pass; otherwise we
-    // capture the failure verdict as a test expectation.
-    if (result.success) {
-      expect(result.success).toBe(true);
-      expect(result.error).toBeUndefined();
-    } else {
-      // Outcome B or C — record the concrete verdict. Intentionally not
-      // self-fixing the template; this test's job is to surface the failure.
-      expect(result.success).toBe(false);
-      expect(result.error).toBeDefined();
-    }
+    // Wave D.1 scope: PREFIX phases 1-7 execute end-to-end, dispatcher
+    // routes to path 1 (path_id=1), path 1 body is a D.1 stub (single
+    // trailing OP_1 sentinel). Post-condition: canonical §2 zone on main
+    // stack (14 slots at fixed depths) + OP_1 sentinel on top.
+    //
+    // Strict assertion: the script MUST succeed. Wave C's diagnostic mode
+    // (accept success OR failure) is retired — PREFIX correctness is
+    // non-negotiable. D.2+ assertions add SUFFIX-level checks on top of this.
+    expect(result.success).toBe(true);
+    expect(result.error).toBeUndefined();
   });
 });

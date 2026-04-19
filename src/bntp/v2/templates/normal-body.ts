@@ -5,6 +5,7 @@ import {
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
   PREIMAGE_PARSE_ASM,
+  prefixOwnerAndZoneAsm,
   tailCacheAsm,
   VARINT_SERIALIZE_ASM,
   authorityIdentityAsm,
@@ -146,344 +147,47 @@ const BODY_MARKER_BYTES = new Uint8Array([0x4c, 0x02, 0x01, 0xff, 0x75]);
 // count honest.
 
 // ---------------------------------------------------------------------------
-// §3.6 Owner identity check (PKH only — Wave C.5 rewrite)
+// §3.6 / §3.7 / §3.8 — Superseded by `prefixOwnerAndZoneAsm` (Wave D.1).
 // ---------------------------------------------------------------------------
-// Per spec §8.1 / decision #29: PKH owner requires TWO checks:
-//   1. HASH160(owner_pubkey) == owner_pkh (identity binding)
-//   2. Explicit OP_CHECKSIGVERIFY(owner_sig, owner_pubkey)
-// Covenant's CHECKSIGVERIFY (§3.2) is preimage-auth only, NOT owner-auth.
 //
-// -- Phase 1B Wave C.5 rewrite --------------------------------------------
-// The prior block (flagged "NOT yet execution-verified" by original author)
-// was written against an imagined altstack layout and the 4th FROMALTSTACK
-// pulled `amount` (16b) from altstack — then `20 OP_AND` tried to bitwise-AND
-// a 1-byte literal with a 16-byte value, raising "Bitwise length mismatch".
-// The MPKH branch had similar stack-order issues that would surface later.
+// The prior split of owner-identity (§3.6) and tail-cache (§3.5) blocks is
+// replaced by the single `prefixOwnerAndZoneAsm(bodySize)` helper in
+// `shared-prefix.ts`. It implements PREFIX Phases 5+6+7 per
+// `docs/BNTP_V2_PREFIX_CONTRACT.md` and produces the canonical §2 system zone
+// (14 fixed-depth slots on main, altstack empty). Historical code below
+// (`OWNER_IDENTITY_ASM`) is removed; callers consume the zone via OP_PICK/
+// OP_ROLL from fixed depths.
 //
-// The rewrite is PKH-only (matches Wave C.4 TAIL_CACHE scope: `14 OP_NUMEQUALVERIFY`
-// already hard-rejects MPKH owners). MPKH owner support is deferred to a
-// follow-up wave (requires altstack surgery in both TAIL_CACHE and here).
-//
-// -- Preconditions --------------------------------------------------------
-// main stack top-down: [pubkey, sig, path_id, ...]
-// altstack top-down :
-//   [scriptCode, optionalData, depth, confiscAuthHash, freezeAuthHash,
-//    authorityFlags, amount, issuerPkh, tokenId, owner_pkh,
-//    hashOutputs, thisOutpoint, hashPrevouts]
-//
-// -- Algorithm ------------------------------------------------------------
-// 1. Pop 10 items off altstack → owner_pkh ends up on main top, pubkey at
-//    depth 10, tail fields at depth 1..9.
-// 2. OP_10 OP_PICK copies pubkey to top; OP_HASH160 hashes it; OP_EQUALVERIFY
-//    compares against owner_pkh (which is now second-from-top).
-// 3. Push the 9 preserved tail fields back to altstack in order. Net altstack
-//    effect: owner_pkh consumed, all other fields in same relative order.
-// 4. main top is now [pubkey, sig, ...] — OP_CHECKSIGVERIFY consumes both.
-//
-// -- Postconditions -------------------------------------------------------
-// main stack top-down: [path_id, ...]
-// altstack top-down :
-//   [scriptCode, optionalData, depth, confiscAuthHash, freezeAuthHash,
-//    authorityFlags, amount, issuerPkh, tokenId,
-//    hashOutputs, thisOutpoint, hashPrevouts]  (owner_pkh removed)
-const OWNER_IDENTITY_ASM = `
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-  OP_FROMALTSTACK
-
-  OP_10 OP_PICK
-  OP_HASH160
-  OP_EQUALVERIFY
-
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-  OP_TOALTSTACK
-
-  OP_CHECKSIGVERIFY
-`;
+// Legacy placeholder left intentionally blank.
+// ---------------------------------------------------------------------------
+// (See §3.6/§3.7/§3.8 notice above.)
 
 // ---------------------------------------------------------------------------
-// §3.7 Path dispatcher
+// §4.1 Path 1 — flex-transfer SUFFIX (Wave D.1 stub)
 // ---------------------------------------------------------------------------
-// path_id ∈ [1, 4] range check, then 4-way dispatch. Paths 2-4 are stubbed
-// (`OP_FALSE OP_VERIFY`). Path 1 is the flex-transfer suffix body below.
-const DISPATCHER_HEADER_ASM = `
-  OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
-  OP_DUP OP_1 OP_EQUAL OP_IF
-`;
-
-// DISPATCHER_MIDDLE_ASM is defined below, after paths 2, 3, 4 constants
-// (§4.2-§4.4), because its template expansion inlines them. See definition
-// just above the NORMAL_BODY_ASM assembly block.
-
-// ---------------------------------------------------------------------------
-// §4.1 Path 1 — flex-transfer SUFFIX
-// ---------------------------------------------------------------------------
-// Stack expected on entry (schematic — exact choreography is A.2 refinement):
-//   main: [preimage ... M output_tuples... amounts_in_array all_input_outpoints selfPosition max_input_depth ...]
-//   alt: [ hashPrevouts, thisOutpoint, scriptCode (consumed), hashOutputs, tokenId, issuerPkh, amount, authorityFlags, freezeAuthHash, confiscAuthHash, attestation_depth, optionalData, owner_field ]
 //
-// For byte-count honesty we write the real opcodes that spec §9.2 mandates.
-
-// (a) hashPrevouts binding: HASH256(all_input_outpoints ‖ funding_outpoint) == hashPrevouts
-const PATH1_HASHPREVOUTS_BIND_ASM = `
-  OP_OVER OP_OVER OP_CAT
-  OP_HASH256
-  OP_FROMALTSTACK
-  OP_DUP OP_TOALTSTACK
-  OP_EQUALVERIFY
-`;
-
-// (b) N derive: N = |all_input_outpoints| / 36; N ∈ [1, 32]
-const PATH1_N_DERIVE_ASM = `
-  OP_OVER OP_SIZE OP_NIP
-  OP_DUP 24 OP_MOD 00 OP_EQUALVERIFY
-  24 OP_DIV
-  OP_DUP OP_1 OP_GREATERTHANOREQUAL OP_VERIFY
-  OP_DUP 20 OP_LESSTHANOREQUAL OP_VERIFY
-  OP_TOALTSTACK
-`;
-
-// (c) selfPosition: all_input_outpoints[selfPos*36..+36] == thisOutpoint
-const PATH1_SELFPOS_OUTPOINT_ASM = `
-  OP_DUP 24 OP_MUL
-  OP_2 OP_PICK OP_SWAP OP_SPLIT OP_NIP
-  24 OP_SPLIT OP_DROP
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_EQUALVERIFY
-`;
-
-// (d) amounts_in_array length == N*16, and amounts_in_array[selfPos*16..+16] == my_amount
-const PATH1_AMOUNTS_ARRAY_ASM = `
-  OP_3 OP_PICK OP_SIZE OP_NIP
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK 10 OP_MUL
-  OP_EQUALVERIFY
-  OP_DUP 10 OP_MUL
-  OP_4 OP_PICK OP_SWAP OP_SPLIT OP_NIP
-  10 OP_SPLIT OP_DROP
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_EQUALVERIFY
-`;
-
-// (e) M range check: M ∈ [1, 4]
-const PATH1_M_CHECK_ASM = `
-  OP_DEPTH OP_1SUB OP_PICK
-  OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
-  OP_TOALTSTACK
-`;
-
-// (f) max_input_depth: my_depth ≤ max_input_depth
-const PATH1_DEPTH_CHECK_ASM = `
-  OP_OVER
-  00 OP_CAT OP_BIN2NUM
-  OP_FROMALTSTACK OP_FROMALTSTACK
-  OP_DUP OP_TOALTSTACK OP_SWAP OP_TOALTSTACK
-  00 OP_CAT OP_BIN2NUM
-  OP_SWAP OP_LESSTHANOREQUAL OP_VERIFY
-`;
-
-// (g) Amount conservation — sum inputs (×4 unrolled, gated on i < N) and
-// sum outputs (×4 unrolled, gated on i < M), then EQUALVERIFY.
+// Wave D.1 scope is PREFIX-only: this block must validate the full PREFIX
+// (covenant + preimage parse + Phase 5/6/7 zone setup + dispatcher) via an
+// end-to-end execution test (`bntp-v2-normal-execution.test.ts`). The path 1
+// body itself is deferred to Wave D.2.
 //
-// Per-iteration cost: push offset constant, extract 16b slice from the
-// array, BIN2NUM, accumulate via altstack, with i<N gate (OP_IF...OP_ENDIF).
-// ~20-25b × 4 per side.
-const PATH1_SUM_INPUTS_ASM = `
-  OP_0 OP_TOALTSTACK
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_0 OP_LESSTHAN OP_NOT
-  OP_IF
-    OP_2 OP_PICK OP_0 10 OP_ADD OP_SPLIT OP_NIP 10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_1 OP_GREATERTHAN
-  OP_IF
-    OP_2 OP_PICK 10 OP_ADD OP_SPLIT OP_NIP 10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_2 OP_GREATERTHAN
-  OP_IF
-    OP_2 OP_PICK 20 OP_ADD OP_SPLIT OP_NIP 10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_3 OP_GREATERTHAN
-  OP_IF
-    OP_2 OP_PICK 30 OP_ADD OP_SPLIT OP_NIP 10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-`;
-
-const PATH1_SUM_OUTPUTS_ASM = `
-  OP_0 OP_TOALTSTACK
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_0 OP_GREATERTHAN
-  OP_IF
-    OP_DEPTH OP_1SUB OP_PICK
-    10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_1 OP_GREATERTHAN
-  OP_IF
-    OP_DEPTH OP_2 OP_SUB OP_PICK
-    10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_2 OP_GREATERTHAN
-  OP_IF
-    OP_DEPTH OP_3 OP_SUB OP_PICK
-    10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_3 OP_GREATERTHAN
-  OP_IF
-    OP_DEPTH OP_4 OP_SUB OP_PICK
-    10 OP_SPLIT OP_DROP
-    OP_8 OP_SPLIT OP_SWAP OP_BIN2NUM OP_SWAP OP_BIN2NUM
-    OP_0 OP_EQUALVERIFY
-    OP_FROMALTSTACK OP_ADD OP_TOALTSTACK
-  OP_ENDIF
-
-  OP_FROMALTSTACK OP_FROMALTSTACK OP_EQUALVERIFY
-`;
-
-// (h) Output reconstruction ×4, gated on i < M. For each output tuple we:
-//   - Parse tuple into (amount 16b, owner 20b/MPKH, new_depth 2b, body_marker 2b)
-//   - Anti-dust: amount > 0
-//   - body_marker == 0x01ff (Normal)
-//   - new_depth saturates: depth == min(max_input_depth + 1, 65535)
-//   - Build candidate locking script: owner_push ‖ 00 6d (action_data + OP_2DROP)
-//     ‖ body_before_tail (from altstack cache) ‖ 6a (OP_RETURN) ‖ reconstructed_tail
-//     where reconstructed_tail = tokenId ‖ issuerPkh ‖ new_amount ‖ authorityFlags
-//       ‖ freezeAuthHash ‖ confiscAuthHash ‖ new_depth ‖ optionalData
-//   - Serialize output: 8b satoshis (anti-dust 1) ‖ varint(len) ‖ candidate_script
-//   - Accumulate into outputs_hash_buffer
+// D.1 path 1 body: empty. The dispatcher's trailing `OP_1` sentinel (one per
+// branch, per decision D.0.4) is the sole output of path 1. A successful
+// run therefore proves only that PREFIX executes cleanly and the dispatcher
+// routes to branch 1 — it says nothing about suffix semantics.
 //
-// A.2.5 retro-optimization (decision #38): the varint block is now FD-only
-// single-branch (mirroring A.2's `VARINT_SERIALIZE_ASM` helper) instead of the
-// original three-branch selector. Candidate locking scripts always land in the
-// `[0xFD..0xFFFF]` range, so the smaller (252-byte) and larger (≥64KB)
-// branches were dead code. Savings: ~30b per iteration × 4 iterations = ~120b
-// cumulative, measured −136b. Correctness caveat identical to §4.X helper.
-const PATH1_OUTPUT_ONE_ASM = `
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  OP_0 OP_GREATERTHAN
-  OP_IF
-    OP_DEPTH OP_1SUB OP_PICK
-    10 OP_SPLIT
-    OP_OVER OP_BIN2NUM OP_0 OP_GREATERTHAN OP_VERIFY
-    OP_SWAP OP_TOALTSTACK
-    14 OP_SPLIT
-    OP_SWAP
-    OP_DUP OP_SIZE OP_NIP 14 OP_NUMEQUALVERIFY
-    OP_TOALTSTACK
-    OP_2 OP_SPLIT
-    OP_SWAP OP_TOALTSTACK
-    01ff OP_EQUALVERIFY
-    OP_FROMALTSTACK
-    OP_DUP 00 OP_CAT OP_BIN2NUM
-    OP_DUP OP_0 OP_GREATERTHANOREQUAL OP_VERIFY
-    FFFF 00 OP_CAT OP_BIN2NUM OP_LESSTHANOREQUAL OP_VERIFY
-    OP_FROMALTSTACK
-    14 OP_CAT
-    006D OP_CAT
-    OP_FROMALTSTACK
-    OP_CAT
-    6A OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_SWAP OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-    OP_SWAP OP_CAT
-    OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-    0100000000000000 OP_SWAP OP_CAT
-    OP_SIZE OP_SWAP
-    OP_SWAP FD OP_SWAP OP_2 OP_SPLIT OP_DROP OP_CAT OP_CAT OP_SWAP OP_CAT
-    OP_CAT
-  OP_ENDIF
-`;
+// Preserved as an empty constant so the section-size export table and the
+// dispatcher template interpolation shape match D.2's shape without a
+// structural diff (D.2 replaces `PATH1_ASM` content, not its identifier).
+const PATH1_ASM = ``;
 
-// Four iterations of output reconstruction. The four bodies are identical in
-// shape but pick from successively deeper tuple slots. We collapse via
-// concatenation for byte accuracy.
-const PATH1_OUTPUT_RECON_ASM = `
-  ${PATH1_OUTPUT_ONE_ASM}
-  ${PATH1_OUTPUT_ONE_ASM}
-  ${PATH1_OUTPUT_ONE_ASM}
-  ${PATH1_OUTPUT_ONE_ASM}
-`;
-
-// (i) hashOutputs closure. Accumulator (built across iterations above) is now
-// HASH256'd and compared to hashOutputs from preimage cache. Also optional
-// null-data output append.
-const PATH1_HASHOUTPUTS_CLOSE_ASM = `
-  OP_DEPTH OP_1SUB OP_PICK
-  OP_DUP OP_SIZE OP_NIP
-  OP_0 OP_GREATERTHAN
-  OP_IF
-    OP_DUP OP_SIZE OP_NIP
-    OP_DUP FC00 OP_LESSTHANOREQUAL
-    OP_IF
-      OP_1 OP_SPLIT OP_DROP OP_CAT
-    OP_ELSE
-      OP_DUP FFFF OP_LESSTHANOREQUAL
-      OP_IF
-        FD OP_SWAP OP_2 OP_SPLIT OP_DROP OP_CAT OP_CAT
-      OP_ELSE
-        FE OP_SWAP OP_4 OP_SPLIT OP_DROP OP_CAT OP_CAT
-      OP_ENDIF
-    OP_ENDIF
-    0000000000000000 OP_SWAP OP_CAT
-    OP_SWAP OP_CAT
-  OP_ELSE
-    OP_DROP
-  OP_ENDIF
-  OP_HASH256
-  OP_FROMALTSTACK
-  OP_EQUALVERIFY
-`;
+// Legacy path-1 sub-blocks (A.2 altstack-centric design) — REMOVED in
+// Wave D.1. The whole D.2 path-1 body will be authored as one coherent
+// PICK/ROLL walk against the §2 main-stack zone. Keeping the old blocks
+// as unreferenced identifiers would be confusing, so they are deleted.
+//
+// For historical reference see commit 18490e2^ (pre-D.0) or
+// `docs/BNTP_V2_NORMAL_TEMPLATE_A3_REPORT.md`.
 
 // ---------------------------------------------------------------------------
 // §4.X Shared helpers for paths 2, 3, 4
@@ -777,73 +481,61 @@ export const PATH4_CONFISCATE_ASM = `
 `;
 
 // ---------------------------------------------------------------------------
-// §3.7 (continued) Dispatcher middle (paths 2, 3, 4)
+// §3.7 Path dispatcher (Wave D.1 rewrite)
 // ---------------------------------------------------------------------------
-// Gates paths 2, 3, 4 on path_id. Each inner branch runs the path's real
-// SUFFIX (A.2 scope: PATH2_REFRESH_ASM / PATH3_FREEZE_ASM /
-// PATH4_CONFISCATE_ASM). Leading OP_ENDIF closes the path-1 branch opened
-// in DISPATCHER_HEADER_ASM; trailing OP_DROP consumes the path_id byte.
-const DISPATCHER_MIDDLE_ASM = `
-  OP_ENDIF
-  OP_DUP OP_2 OP_EQUAL OP_IF
+// Nested OP_IF/OP_ELSE chain with explicit trailing OP_1 sentinel per branch
+// (decision D.0.4). Pre-condition: path_id on top of main stack (depth 0 in
+// the §2 canonical zone). Post-condition: sentinel OP_1 on top, zone below
+// path_id unchanged, path_id consumed by OP_NIP.
+//
+// path_id range check (∈ [1..4]) is up-front via OP_WITHIN; the final OP_ELSE
+// therefore degenerates to "must be path 4" with no extra ELSE clause. Paths
+// 2/3/4 bodies are legacy A.2 altstack-centric ASM and are DEAD code in D.1
+// (test scenario uses path_id=1 only). D.3 rewrites them against the new
+// main-stack zone.
+const DISPATCHER_ASM = `
+  OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
+  OP_DUP OP_1 OP_EQUAL OP_IF
+    ${PATH1_ASM}
+    OP_1
+  OP_ELSE OP_DUP OP_2 OP_EQUAL OP_IF
     ${PATH2_REFRESH_ASM}
-  OP_ENDIF
-  OP_DUP OP_3 OP_EQUAL OP_IF
+    OP_1
+  OP_ELSE OP_DUP OP_3 OP_EQUAL OP_IF
     ${PATH3_FREEZE_ASM}
-  OP_ENDIF
-  OP_DUP OP_4 OP_EQUAL OP_IF
+    OP_1
+  OP_ELSE
     ${PATH4_CONFISCATE_ASM}
-  OP_ENDIF
-  OP_DROP
+    OP_1
+  OP_ENDIF OP_ENDIF OP_ENDIF
+  OP_NIP
 `;
 
 // ---------------------------------------------------------------------------
-// Assemble NORMAL_BODY_ASM
+// Assemble NORMAL_BODY_ASM (Wave D.1)
 // ---------------------------------------------------------------------------
-// `tailCacheAsm(prefixBeforeTailSize)` needs the offset from the start of the
-// compiled scriptCode to the start of the tail. For a PKH-owner locking
-// script that offset is `22 (owner push) + 2 (OP_0 OP_2DROP) + |body| + 1
-// (OP_RETURN)`. The `|body|` term depends recursively on `tailCacheAsm`'s
-// own compiled byte count — but `tailCacheAsm(N)` encodes N as a fixed-width
-// 2-byte little-endian push, so its compiled byte count is invariant in N.
-// That lets us compile once with an arbitrary placeholder, measure the body
-// size, and emit the final body in a single recompile. A trivial 1-step
-// fixed-point.
-const buildNormalBodyAsm = (prefixBeforeTailSize: number): string => `
+// `prefixOwnerAndZoneAsm(bodySize)` consumes scriptCode from altstack and
+// produces the canonical §2 main-stack zone. Its compiled byte count is
+// invariant in `bodySize` (fixed-width 2-byte LE push), enabling a 1-pass
+// fixed-point compile: measure body with placeholder 0, then re-emit with
+// the measured value.
+const buildNormalBodyAsm = (bodySize: number): string => `
   ${COVENANT_PREIMAGE_ROLL_ASM}
   ${COVENANT_S_PREAMBLE_ASM}
   ${COVENANT_TAIL_ASM}
   ${SIGHASH_CHECK_ASM}
   ${PREIMAGE_PARSE_ASM}
-  ${tailCacheAsm(prefixBeforeTailSize)}
-  ${OWNER_IDENTITY_ASM}
-  ${DISPATCHER_HEADER_ASM}
-  ${PATH1_HASHPREVOUTS_BIND_ASM}
-  ${PATH1_N_DERIVE_ASM}
-  ${PATH1_SELFPOS_OUTPOINT_ASM}
-  ${PATH1_AMOUNTS_ARRAY_ASM}
-  ${PATH1_M_CHECK_ASM}
-  ${PATH1_DEPTH_CHECK_ASM}
-  ${PATH1_SUM_INPUTS_ASM}
-  ${PATH1_SUM_OUTPUTS_ASM}
-  ${PATH1_OUTPUT_RECON_ASM}
-  ${PATH1_HASHOUTPUTS_CLOSE_ASM}
-  ${DISPATCHER_MIDDLE_ASM}
+  ${prefixOwnerAndZoneAsm(bodySize)}
+  ${DISPATCHER_ASM}
 `;
 
-// First pass: measure body size with any placeholder offset.
+// First pass: measure body size with placeholder.
 const MEASUREMENT_BODY_BYTES = (() => {
   const tail = asmToBytes(buildNormalBodyAsm(0));
   return BODY_MARKER_BYTES.length + tail.length;
 })();
 
-// PKH owner prefix-before-tail = 0x14(1) + owner_pkh(20) + OP_0(1) + OP_2DROP(1)
-//   + body(MEASUREMENT_BODY_BYTES) + OP_RETURN(1) = |body| + 24.
-const PREFIX_BEFORE_TAIL_SIZE = MEASUREMENT_BODY_BYTES + 24;
-
-export const TAIL_CACHE_ASM = tailCacheAsm(PREFIX_BEFORE_TAIL_SIZE);
-
-export const NORMAL_BODY_ASM = buildNormalBodyAsm(PREFIX_BEFORE_TAIL_SIZE);
+export const NORMAL_BODY_ASM = buildNormalBodyAsm(MEASUREMENT_BODY_BYTES);
 
 /**
  * Compile NORMAL_BODY_ASM to raw bytes. Prepends the body-marker PUSHDATA1
@@ -862,15 +554,20 @@ export const NORMAL_BODY_BYTES: Uint8Array = compileNormalBody();
 export const NORMAL_BODY_SIZE: number = NORMAL_BODY_BYTES.length;
 
 // Invariant check: the measurement pass must match the final pass, since
-// `tailCacheAsm`'s compiled size is invariant in the offset value. A
-// violation indicates the ASM builder broke the fixed-width push assumption
+// `prefixOwnerAndZoneAsm`'s compiled size is invariant in the bodySize value.
+// A violation indicates the ASM builder broke the fixed-width push assumption
 // (e.g., a value above 0x7FFF encoding with different semantics).
 if (NORMAL_BODY_SIZE !== MEASUREMENT_BODY_BYTES) {
   throw new Error(
-    `BNTP v2 Normal body: tailCacheAsm compile size changed with offset. ` +
+    `BNTP v2 Normal body: prefixOwnerAndZoneAsm compile size changed with bodySize. ` +
       `Measured=${MEASUREMENT_BODY_BYTES}, final=${NORMAL_BODY_SIZE}.`,
   );
 }
+
+// Back-compat re-export. Callers outside this file still reference
+// `TAIL_CACHE_ASM` from the old A.2 design. D.5 will migrate Contract +
+// Frozen to the new PREFIX and remove this placeholder.
+export const TAIL_CACHE_ASM = tailCacheAsm(NORMAL_BODY_SIZE + 24);
 
 /**
  * Per-section byte breakdown (for reporting). Each section is compiled in
@@ -883,27 +580,18 @@ export const NORMAL_BODY_SECTION_SIZES = {
   covenantTail: asmToBytes(COVENANT_TAIL_ASM).length,
   sighashCheck: asmToBytes(SIGHASH_CHECK_ASM).length,
   preimageParse: asmToBytes(PREIMAGE_PARSE_ASM).length,
-  tailCache: asmToBytes(TAIL_CACHE_ASM).length,
-  ownerIdentity: asmToBytes(OWNER_IDENTITY_ASM).length,
-  dispatcherHeader: asmToBytes(DISPATCHER_HEADER_ASM).length,
-  path1HashprevoutsBind: asmToBytes(PATH1_HASHPREVOUTS_BIND_ASM).length,
-  path1NDerive: asmToBytes(PATH1_N_DERIVE_ASM).length,
-  path1SelfposOutpoint: asmToBytes(PATH1_SELFPOS_OUTPOINT_ASM).length,
-  path1AmountsArray: asmToBytes(PATH1_AMOUNTS_ARRAY_ASM).length,
-  path1MCheck: asmToBytes(PATH1_M_CHECK_ASM).length,
-  path1DepthCheck: asmToBytes(PATH1_DEPTH_CHECK_ASM).length,
-  path1SumInputs: asmToBytes(PATH1_SUM_INPUTS_ASM).length,
-  path1SumOutputs: asmToBytes(PATH1_SUM_OUTPUTS_ASM).length,
-  path1OutputRecon: asmToBytes(PATH1_OUTPUT_RECON_ASM).length,
-  path1HashoutputsClose: asmToBytes(PATH1_HASHOUTPUTS_CLOSE_ASM).length,
-  // A.2 — path 2 refresh, path 3 freeze, path 4 confiscate. Each measurement
-  // is the raw SUFFIX body bytes (NOT including the outer path_id OP_IF/OP_ENDIF
-  // gate, which is counted in dispatcherMiddle's ~10b overhead).
+  prefixOwnerAndZone: asmToBytes(prefixOwnerAndZoneAsm(NORMAL_BODY_SIZE))
+    .length,
+  path1: asmToBytes(PATH1_ASM).length,
   path2Refresh: asmToBytes(PATH2_REFRESH_ASM).length,
   path3Freeze: asmToBytes(PATH3_FREEZE_ASM).length,
   path4Confiscate: asmToBytes(PATH4_CONFISCATE_ASM).length,
-  dispatcherMiddle:
-    asmToBytes(DISPATCHER_MIDDLE_ASM).length -
+  // Dispatcher overhead = total dispatcher compiled size minus the inlined
+  // path bodies (OP_IF/OP_ELSE/OP_ENDIF gates + path_id DUP/EQUAL chain +
+  // trailing OP_1 sentinels + OP_NIP).
+  dispatcher:
+    asmToBytes(DISPATCHER_ASM).length -
+    asmToBytes(PATH1_ASM).length -
     asmToBytes(PATH2_REFRESH_ASM).length -
     asmToBytes(PATH3_FREEZE_ASM).length -
     asmToBytes(PATH4_CONFISCATE_ASM).length,

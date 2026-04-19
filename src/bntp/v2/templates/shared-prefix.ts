@@ -269,6 +269,102 @@ export const tailCacheAsm = (prefixBeforeTailSize: number): string => {
 // an invalid script if inlined directly (offset = 0).
 export const TAIL_CACHE_ASM = tailCacheAsm(0);
 
+// ===========================================================================
+// §3.5 + §3.6 + §3.7 — PREFIX Phases 5 + 6 + 7 (Wave D.1 rewrite, canonical)
+// ===========================================================================
+//
+// Supersedes `tailCacheAsm` + `OWNER_IDENTITY_ASM` (their altstack-centric
+// design was the class of bug surfaced by Wave C.1-C.5). See
+// `docs/BNTP_V2_PREFIX_CONTRACT.md` for the full spec.
+//
+// -- Precondition (PREFIX Phases 1-4 already executed) ---------------------
+//
+//   main top-down = [pubkey, sig, path_id, ...unlocking_rest]
+//   alt  top-down = [scriptCode, hashOutputs, thisOutpoint, hashPrevouts]
+//
+// -- Postcondition (canonical system zone per spec §2) ---------------------
+//
+//   main top-down =
+//     [path_id,
+//      hashPrevouts, thisOutpoint, hashOutputs,
+//      owner_pkh, body,
+//      optionalData, depth, confiscAuth, freezeAuth, authFlags,
+//      amount, issuerPkh, tokenId,
+//      ...unlocking_rest]
+//   alt = []
+//
+// -- Algorithm --------------------------------------------------------------
+//
+// Phase 5: pull scriptCode from alt, split off owner prefix
+//          (`0x14 ‖ owner_pkh(20) ‖ 0x00 0x6D`), verify marker, extract
+//          owner_pkh, HASH160(pubkey)==owner_pkh, CHECKSIGVERIFY.
+//          Stashes owner_pkh and remaining scriptCode to alt.
+//
+// Phase 6: pull scriptCode tail (past action_data), extract body using
+//          compile-time `bodySize`, strip OP_RETURN marker, natural
+//          OP_SPLIT walk of tail → 8 tail-derived values on main.
+//
+// Phase 7: drain alt (body, owner_pkh, hashOutputs, thisOutpoint,
+//          hashPrevouts onto main), `OP_13 OP_ROLL` brings path_id to top.
+//
+// -- Design invariants ------------------------------------------------------
+//
+// * `bodySize` is encoded as a fixed-width 2-byte LE push, so this block's
+//   compiled byte length is invariant in the value — enabling a trivial
+//   1-pass fixed-point compile in the caller (see `normal-body.ts`).
+// * PKH-only owner scope (Phase 5 marker check `14 OP_EQUALVERIFY` hard-
+//   rejects MPKH owners). Decision D.0.3.
+// * No intra-block altstack state leaks: altstack is empty on exit. Decision
+//   D.0.1 / §5 invariant 1.
+//
+// -- Byte cost --------------------------------------------------------------
+//
+// Approximate: Phase 5 ~22b + Phase 6 ~22b + Phase 7 ~7b = ~51b total.
+// Replaces previous ~144b (tailCacheAsm ~119b + OWNER_IDENTITY_ASM ~25b).
+export const prefixOwnerAndZoneAsm = (bodySize: number): string => {
+  // Fixed-width 2-byte little-endian hex push. Value is the compile-time
+  // Normal-body byte length.
+  const lo = bodySize & 0xff;
+  const hi = (bodySize >> 8) & 0xff;
+  const bodyLenHex = (
+    lo.toString(16).padStart(2, "0") + hi.toString(16).padStart(2, "0")
+  ).toLowerCase();
+  return `
+    OP_FROMALTSTACK
+    OP_1 OP_SPLIT OP_SWAP
+    14 OP_EQUALVERIFY
+    14 OP_SPLIT OP_SWAP
+    OP_DUP OP_TOALTSTACK
+    OP_2 OP_PICK OP_HASH160 OP_EQUALVERIFY
+    OP_TOALTSTACK
+    OP_CHECKSIGVERIFY
+    OP_FROMALTSTACK
+    OP_2 OP_SPLIT OP_SWAP
+    006D OP_EQUALVERIFY
+
+    ${bodyLenHex} OP_BIN2NUM OP_SPLIT
+    OP_SWAP OP_TOALTSTACK
+    OP_1 OP_SPLIT OP_SWAP
+    6A OP_EQUALVERIFY
+
+    20 OP_SPLIT
+    14 OP_SPLIT
+    OP_16 OP_SPLIT
+    OP_1 OP_SPLIT
+    14 OP_SPLIT
+    14 OP_SPLIT
+    OP_2 OP_SPLIT
+
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+
+    OP_13 OP_ROLL
+  `;
+};
+
 // Output serialization helper — FD-only varint (candidate scripts always
 // land in [0xFD..0xFFFF] range per decision #38; single-branch saves ~120b
 // vs 3-branch generic varint per A.2.5 retro-opt).

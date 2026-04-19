@@ -146,72 +146,73 @@ const BODY_MARKER_BYTES = new Uint8Array([0x4c, 0x02, 0x01, 0xff, 0x75]);
 // count honest.
 
 // ---------------------------------------------------------------------------
-// §3.6 Owner identity check (PKH + MPKH)
+// §3.6 Owner identity check (PKH only — Wave C.5 rewrite)
 // ---------------------------------------------------------------------------
 // Per spec §8.1 / decision #29: PKH owner requires TWO checks:
-//   1. HASH160(owner_pubkey) == owner_field (identity binding)
-//   2. Explicit OP_CHECKSIGVERIFY(owner_sig, owner_pubkey, preimage)
+//   1. HASH160(owner_pubkey) == owner_pkh (identity binding)
+//   2. Explicit OP_CHECKSIGVERIFY(owner_sig, owner_pubkey)
 // Covenant's CHECKSIGVERIFY (§3.2) is preimage-auth only, NOT owner-auth.
 //
-// Owner field is in the variable prefix (before body), not in the tail. For
-// PKH: owner_field = 20b PKH. For MPKH: owner_field = 20b HASH160 of MPKH
-// preimage. The flag bit 5 of authorityFlags indicates MPKH owner.
+// -- Phase 1B Wave C.5 rewrite --------------------------------------------
+// The prior block (flagged "NOT yet execution-verified" by original author)
+// was written against an imagined altstack layout and the 4th FROMALTSTACK
+// pulled `amount` (16b) from altstack — then `20 OP_AND` tried to bitwise-AND
+// a 1-byte literal with a 16-byte value, raising "Bitwise length mismatch".
+// The MPKH branch had similar stack-order issues that would surface later.
 //
-// This block assumes:
-//   - owner_pubkey on top of stack (from unlocking, above [path_id=1])
-//   - owner_sig one-below
-//   - preimage somewhere accessible (on altstack via §3.4)
-//   - authorityFlags available from altstack (cached in §3.5 slot 4 from bottom)
-//   - owner_field pushed here as a template-compile-time constant is NOT
-//     possible since it varies per UTXO; SDK resolves it at locking build.
-//     We read owner_field from the scriptCode's variable-prefix, which means
-//     in real deployment the variable prefix must be walkable. For A.1.1 the
-//     owner_field is assumed to already be on altstack from §3.5's pre-split
-//     step (implicit — A.2 refinement will formalize).
+// The rewrite is PKH-only (matches Wave C.4 TAIL_CACHE scope: `14 OP_NUMEQUALVERIFY`
+// already hard-rejects MPKH owners). MPKH owner support is deferred to a
+// follow-up wave (requires altstack surgery in both TAIL_CACHE and here).
+//
+// -- Preconditions --------------------------------------------------------
+// main stack top-down: [pubkey, sig, path_id, ...]
+// altstack top-down :
+//   [scriptCode, optionalData, depth, confiscAuthHash, freezeAuthHash,
+//    authorityFlags, amount, issuerPkh, tokenId, owner_pkh,
+//    hashOutputs, thisOutpoint, hashPrevouts]
+//
+// -- Algorithm ------------------------------------------------------------
+// 1. Pop 10 items off altstack → owner_pkh ends up on main top, pubkey at
+//    depth 10, tail fields at depth 1..9.
+// 2. OP_10 OP_PICK copies pubkey to top; OP_HASH160 hashes it; OP_EQUALVERIFY
+//    compares against owner_pkh (which is now second-from-top).
+// 3. Push the 9 preserved tail fields back to altstack in order. Net altstack
+//    effect: owner_pkh consumed, all other fields in same relative order.
+// 4. main top is now [pubkey, sig, ...] — OP_CHECKSIGVERIFY consumes both.
+//
+// -- Postconditions -------------------------------------------------------
+// main stack top-down: [path_id, ...]
+// altstack top-down :
+//   [scriptCode, optionalData, depth, confiscAuthHash, freezeAuthHash,
+//    authorityFlags, amount, issuerPkh, tokenId,
+//    hashOutputs, thisOutpoint, hashPrevouts]  (owner_pkh removed)
 const OWNER_IDENTITY_ASM = `
-  OP_FROMALTSTACK OP_FROMALTSTACK OP_FROMALTSTACK OP_FROMALTSTACK
-  OP_DUP OP_TOALTSTACK
-  OP_FROMALTSTACK OP_FROMALTSTACK OP_FROMALTSTACK OP_FROMALTSTACK
-  20 OP_AND 00 OP_EQUAL
-  OP_IF
-    OP_DUP OP_HASH160
-    OP_DUP OP_TOALTSTACK
-    OP_EQUALVERIFY
-    OP_SWAP
-    OP_DUP OP_TOALTSTACK
-    OP_ROT
-    OP_CHECKSIGVERIFY
-  OP_ELSE
-    OP_DUP OP_HASH160
-    OP_DUP OP_TOALTSTACK
-    OP_EQUALVERIFY
-    OP_DUP
-    OP_1 OP_SPLIT OP_SWAP 00 OP_CAT OP_BIN2NUM
-    OP_TOALTSTACK
-    OP_SIZE OP_1SUB OP_SPLIT OP_NIP 00 OP_CAT OP_BIN2NUM
-    OP_DUP OP_0 OP_GREATERTHAN OP_VERIFY
-    OP_DUP OP_1 OP_6 OP_WITHIN OP_VERIFY
-    OP_2DUP OP_LESSTHANOREQUAL OP_VERIFY
-    OP_TOALTSTACK
-    OP_FROMALTSTACK
-    OP_DUP
-    21 OP_SPLIT OP_SWAP OP_TOALTSTACK
-    OP_DUP OP_SIZE OP_NIP OP_IF
-      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
-    OP_ENDIF
-    OP_DUP OP_SIZE OP_NIP OP_IF
-      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
-    OP_ENDIF
-    OP_DUP OP_SIZE OP_NIP OP_IF
-      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
-    OP_ENDIF
-    OP_DUP OP_SIZE OP_NIP OP_IF
-      21 OP_SPLIT OP_SWAP OP_TOALTSTACK
-    OP_ENDIF
-    OP_DROP
-    OP_FROMALTSTACK
-    OP_CHECKMULTISIGVERIFY
-  OP_ENDIF
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+  OP_FROMALTSTACK
+
+  OP_10 OP_PICK
+  OP_HASH160
+  OP_EQUALVERIFY
+
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+  OP_TOALTSTACK
+
+  OP_CHECKSIGVERIFY
 `;
 
 // ---------------------------------------------------------------------------

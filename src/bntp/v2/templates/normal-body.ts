@@ -274,6 +274,116 @@ const PATH1_D2A_DEPTH_CHECK = `
   OP_GREATERTHANOREQUAL OP_VERIFY
 `;
 
+// ---------------------------------------------------------------------------
+// Wave D.2b — sum-in / sum-out / balance check
+// ---------------------------------------------------------------------------
+//
+// Consumes `amounts_in_array` (witness depth 19 at D.2a exit — after our
+// two pushes of sP and N, depth 21) and the N output tuples (witness depth
+// 22 at D.2a exit), verifying Σ(amounts_in) == Σ(tuple.amount_field).
+//
+// Stack discipline:
+//   - Before D.2b: [..., sP, N]  (top = sP; §2 zone + witness below)
+//   - After D.2b:  [..., sP, N]  (identical to D.2a exit — sP/N preserved;
+//     amounts and tuples consumed; balance asserted)
+//
+// The identical shape lets the dispatcher's trailing `OP_1 / OP_NIP` keep
+// working: OP_1 pushes on top, OP_NIP drops sP, leaving OP_1 truthy.
+//
+// Implementation: sum-in unrolled ×4 over 16-byte amount slots via OP_SPLIT
+// + OP_BIN2NUM + OP_ADD; guarded per-iter on residual `|amounts_rem| > 0`.
+// Sum-out unrolled ×4 consuming topmost tuple each iter via
+// `OP_DEPTH OP_2 OP_SUB OP_ROLL`; guarded per-iter on altstack counter > 0
+// (initialized from a pick-copy of N). Post-loop: `OP_NUMEQUALVERIFY`.
+//
+// Max N is 4 (enforced in D.2a §P2 via `OP_WITHIN` against [1..5)); the
+// unroll is exactly 4 iterations so shorter N is handled by the guard
+// predicate branching to a cheap no-op ELSE arm.
+
+// --- Sum-in loop (setup + 4 iters + drop) ---
+//
+// 15 OP_ROLL: pull amounts (at top-depth 21 for our stack state at D.2b
+//             entry) to top. Depth 0x15=21 matches §2 zone(14)+sP+N+witness
+//             layout where amounts_in_array sits at that slot.
+// OP_0      : initial sum_in acc = 0 on top.
+//
+// Per iter: DUP/SIZE/NIP yields `|amounts_rem|`. If >0, OP_16 OP_SPLIT
+// extracts the next 16-byte amount; OP_BIN2NUM decodes it as a scriptnum;
+// OP_ROT + OP_ADD folds it into the acc; final OP_SWAP restores invariant
+// (amounts_rem on top, acc below). If 0, ELSE is empty — guard naturally
+// idempotent so N<4 inputs simply hit IF N times then ELSE (4-N) times.
+
+const PATH1_D2B_SUM_IN_ITER = `
+  OP_DUP OP_SIZE OP_NIP
+  OP_0 OP_GREATERTHAN
+  OP_IF
+    OP_16 OP_SPLIT
+    OP_SWAP OP_BIN2NUM
+    OP_ROT OP_ADD
+    OP_SWAP
+  OP_ENDIF
+`;
+
+const PATH1_D2B_SUM_IN = `
+  15 OP_ROLL
+  OP_0
+  ${PATH1_D2B_SUM_IN_ITER}
+  ${PATH1_D2B_SUM_IN_ITER}
+  ${PATH1_D2B_SUM_IN_ITER}
+  ${PATH1_D2B_SUM_IN_ITER}
+  OP_DROP
+`;
+
+// --- Sum-out loop (setup + 4 iters + cleanup) ---
+//
+// OP_0              : initial sum_out acc = 0 on top.
+// OP_3 OP_PICK      : copy N (depth 3 post-push) to top.
+// OP_TOALTSTACK     : stash as loop counter on altstack.
+//
+// Per iter: FROMALT counter, DUP, `>0` guard.
+//   IF  : 1SUB then TOALT (put counter-1 back); DEPTH-2 ROLL pulls the
+//         topmost tuple to top; OP_16 OP_SPLIT OP_DROP keeps the left-16b
+//         (amount field); OP_BIN2NUM + OP_ADD folds into acc.
+//   ELSE: TOALT puts the counter (already 0) back, nothing to do.
+//
+// Cleanup: FROMALT / DROP discards the final counter.
+
+const PATH1_D2B_SUM_OUT_ITER = `
+  OP_FROMALTSTACK
+  OP_DUP
+  OP_0 OP_GREATERTHAN
+  OP_IF
+    OP_1SUB
+    OP_TOALTSTACK
+    OP_DEPTH OP_2 OP_SUB OP_ROLL
+    OP_16 OP_SPLIT OP_DROP
+    OP_BIN2NUM
+    OP_ADD
+  OP_ELSE
+    OP_TOALTSTACK
+  OP_ENDIF
+`;
+
+const PATH1_D2B_SUM_OUT = `
+  OP_0
+  OP_3 OP_PICK
+  OP_TOALTSTACK
+  ${PATH1_D2B_SUM_OUT_ITER}
+  ${PATH1_D2B_SUM_OUT_ITER}
+  ${PATH1_D2B_SUM_OUT_ITER}
+  ${PATH1_D2B_SUM_OUT_ITER}
+  OP_FROMALTSTACK OP_DROP
+`;
+
+// --- Balance check: Σ_in == Σ_out ---
+//
+// Both are minimal-encoded scriptnums produced by OP_ADD (accumulator of
+// BIN2NUM results). OP_NUMEQUALVERIFY asserts numeric equality, aborting
+// on mismatch. Consumes both values from top.
+const PATH1_D2B_BALANCE_CHECK = `
+  OP_NUMEQUALVERIFY
+`;
+
 const PATH1_ASM = `
   ${PATH1_D2A_HASH_PREVOUTS_BIND}
   ${PATH1_D2A_N_DERIVE_AND_AMOUNTS_LEN}
@@ -281,6 +391,9 @@ const PATH1_ASM = `
   ${PATH1_D2A_MY_AMOUNT_CHECK}
   ${PATH1_D2A_M_RANGE}
   ${PATH1_D2A_DEPTH_CHECK}
+  ${PATH1_D2B_SUM_IN}
+  ${PATH1_D2B_SUM_OUT}
+  ${PATH1_D2B_BALANCE_CHECK}
 `;
 
 // Legacy path-1 sub-blocks (A.2 altstack-centric design) — REMOVED in

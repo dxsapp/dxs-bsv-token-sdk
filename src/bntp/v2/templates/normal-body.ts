@@ -163,28 +163,129 @@ const BODY_MARKER_BYTES = new Uint8Array([0x4c, 0x02, 0x01, 0xff, 0x75]);
 // (See §3.6/§3.7/§3.8 notice above.)
 
 // ---------------------------------------------------------------------------
-// §4.1 Path 1 — flex-transfer SUFFIX (Wave D.1 stub)
+// §4.1 Path 1 — flex-transfer SUFFIX (Wave D.2a — pre-loop validation)
 // ---------------------------------------------------------------------------
 //
-// Wave D.1 scope is PREFIX-only: this block must validate the full PREFIX
-// (covenant + preimage parse + Phase 5/6/7 zone setup + dispatcher) via an
-// end-to-end execution test (`bntp-v2-normal-execution.test.ts`). The path 1
-// body itself is deferred to Wave D.2.
+// D.2a scope: non-destructive predicate checks over the §2 zone (depths 0-13)
+// and the unlocking witness (depths 14-21 for N=1). Pure PICK/VERIFY — no
+// stack consumption, no altstack use, no ROLL. On any predicate failure the
+// script aborts via OP_VERIFY; on success the stack's pre-existing items are
+// unchanged, with `sP` (selfPos) and `N` added on top of the zone.
 //
-// D.1 path 1 body: empty. The dispatcher's trailing `OP_1` sentinel (one per
-// branch, per decision D.0.4) is the sole output of path 1. A successful
-// run therefore proves only that PREFIX executes cleanly and the dispatcher
-// routes to branch 1 — it says nothing about suffix semantics.
+// At PATH1_ASM entry (per D.0 §2 zone contract):
+//   depth 0:  path_id                         [ZONE]
+//   depth 1:  hashPrevouts  (32b)             [ZONE]
+//   depth 2:  thisOutpoint  (36b)             [ZONE]
+//   depth 3:  hashOutputs   (32b)             [ZONE]
+//   depth 4:  owner_pkh     (20b)             [ZONE]
+//   depth 5:  body          (var)             [ZONE]
+//   depth 6:  optionalData  (var)             [ZONE]
+//   depth 7:  depth         (2b LE)           [ZONE]
+//   depth 8:  confiscAuth   (20b)             [ZONE]
+//   depth 9:  freezeAuth    (20b)             [ZONE]
+//   depth 10: authFlags     (1b)              [ZONE]
+//   depth 11: amount        (16b LE)          [ZONE]
+//   depth 12: issuerPkh     (20b)             [ZONE]
+//   depth 13: tokenId       (32b)             [ZONE]
+//   depth 14: funding_outpoint  (0 or 36b)    [WITNESS]
+//   depth 15: nullData          (var, may be 0b)
+//   depth 16: max_input_depth   (2b LE)
+//   depth 17: selfPos           (ScriptNum, 0b for value 0)
+//   depth 18: all_input_outpoints  (N*36b)
+//   depth 19: amounts_in_array     (N*16b)
+//   depth 20..20+N-1: output_tuple_k (40b each: amount16‖owner20‖depth2‖marker2)
+//   depth 20+N: M (ScriptNum, 1..N)
 //
-// Preserved as an empty constant so the section-size export table and the
-// dispatcher template interpolation shape match D.2's shape without a
-// structural diff (D.2 replaces `PATH1_ASM` content, not its identifier).
-const PATH1_ASM = ``;
+// D.2a leaves `sP` (selfPos, top) and `N` (below) on the stack above the zone.
+// The dispatcher appends `OP_1` and then `OP_NIP` drops sP, leaving OP_1 on
+// top (truthy sentinel). D.2b consumes sP and N for the sum-in/sum-out loops.
+//
+// Validated invariants:
+//   P1. HashPrevouts binding: HASH256(all_input_outpoints ‖ funding_outpoint)
+//       == zone.hashPrevouts. Binds this covenant to the full set of inputs.
+//   P2. N derive: N = |all_input_outpoints| / 36 with |outpoints| % 36 == 0
+//       and N ∈ [1..4]. Rejects malformed-length outpoints blob.
+//   P3. Amounts length: |amounts_in_array| == N * 16. Array is N elements.
+//   P4. selfPos range: selfPos ∈ [0, N). Guards negative / out-of-range.
+//   P5. selfPos → outpoint: all_input_outpoints[selfPos*36..selfPos*36+36]
+//       == zone.thisOutpoint. This input's outpoint lives at selfPos in the
+//       array; else covenant is being replayed under a different input.
+//   P6. my_amount: amounts_in_array[selfPos*16..selfPos*16+16] == zone.amount.
+//       Witness commitment of my amount matches scriptCode tail byte-exactly.
+//   P7. M range: M ∈ [1, N]. Must have at least 1 authority signature and at
+//       most N (one per input).
+//   P8. Depth ordering: zone.depth ≤ max_input_depth. This input's attested
+//       depth is within the bound signed by the unlocker; per-output depth
+//       verification (new_depth == max_input_depth + 1) is D.2c.
+
+const PATH1_D2A_HASH_PREVOUTS_BIND = `
+  12 OP_PICK
+  OP_15 OP_PICK
+  OP_CAT
+  OP_HASH256
+  OP_2 OP_PICK
+  OP_EQUALVERIFY
+`;
+
+const PATH1_D2A_N_DERIVE_AND_AMOUNTS_LEN = `
+  12 OP_PICK
+  OP_SIZE OP_NIP
+  OP_DUP 24 OP_MOD OP_0 OP_EQUALVERIFY
+  24 OP_DIV
+  OP_DUP OP_1 OP_5 OP_WITHIN OP_VERIFY
+  14 OP_PICK
+  OP_SIZE OP_NIP
+  OP_1 OP_PICK OP_16 OP_MUL
+  OP_EQUALVERIFY
+`;
+
+const PATH1_D2A_SELFPOS_CHECK = `
+  12 OP_PICK
+  OP_DUP OP_0 OP_GREATERTHANOREQUAL OP_VERIFY
+  OP_DUP OP_2 OP_PICK OP_LESSTHAN OP_VERIFY
+  14 OP_PICK
+  OP_1 OP_PICK
+  24 OP_MUL
+  OP_SPLIT OP_NIP
+  24 OP_SPLIT OP_DROP
+  OP_5 OP_PICK
+  OP_EQUALVERIFY
+`;
+
+const PATH1_D2A_MY_AMOUNT_CHECK = `
+  15 OP_PICK
+  OP_1 OP_PICK
+  OP_16 OP_MUL
+  OP_SPLIT OP_NIP
+  OP_16 OP_SPLIT OP_DROP
+  OP_14 OP_PICK
+  OP_EQUALVERIFY
+`;
+
+const PATH1_D2A_M_RANGE = `
+  OP_DEPTH OP_1 OP_SUB OP_PICK
+  OP_DUP OP_1 OP_GREATERTHANOREQUAL OP_VERIFY
+  OP_2 OP_PICK OP_LESSTHANOREQUAL OP_VERIFY
+`;
+
+const PATH1_D2A_DEPTH_CHECK = `
+  12 OP_PICK OP_BIN2NUM
+  OP_10 OP_PICK OP_BIN2NUM
+  OP_GREATERTHANOREQUAL OP_VERIFY
+`;
+
+const PATH1_ASM = `
+  ${PATH1_D2A_HASH_PREVOUTS_BIND}
+  ${PATH1_D2A_N_DERIVE_AND_AMOUNTS_LEN}
+  ${PATH1_D2A_SELFPOS_CHECK}
+  ${PATH1_D2A_MY_AMOUNT_CHECK}
+  ${PATH1_D2A_M_RANGE}
+  ${PATH1_D2A_DEPTH_CHECK}
+`;
 
 // Legacy path-1 sub-blocks (A.2 altstack-centric design) — REMOVED in
-// Wave D.1. The whole D.2 path-1 body will be authored as one coherent
-// PICK/ROLL walk against the §2 main-stack zone. Keeping the old blocks
-// as unreferenced identifiers would be confusing, so they are deleted.
+// Wave D.1. D.2b will add sum-in/sum-out loops (consumes sP and N); D.2c
+// will add output reconstruction ×N with hashOutputs closure.
 //
 // For historical reference see commit 18490e2^ (pre-D.0) or
 // `docs/BNTP_V2_NORMAL_TEMPLATE_A3_REPORT.md`.

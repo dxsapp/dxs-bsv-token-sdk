@@ -155,19 +155,24 @@ const evalAdversarial = (
   const prevOutputs: PrevOutput[] = [
     { lockingScript: inputLockingScript, satoshis: scenario.inputSatoshis },
   ];
-  return evaluateScripts(unlockingScript, inputLockingScript, {
-    tx,
-    inputIndex: 0,
-    prevOutputs,
-  }, {
-    allowOpReturn: true,
-    scriptFlags: FLAGS,
-    strict: false,
-    maxScriptSizeBytes: 2_000_000,
-    maxOps: 100_000,
-    maxStackDepth: 10_000,
-    maxElementSizeBytes: 2_000_000,
-  });
+  return evaluateScripts(
+    unlockingScript,
+    inputLockingScript,
+    {
+      tx,
+      inputIndex: 0,
+      prevOutputs,
+    },
+    {
+      allowOpReturn: true,
+      scriptFlags: FLAGS,
+      strict: false,
+      maxScriptSizeBytes: 2_000_000,
+      maxOps: 100_000,
+      maxStackDepth: 10_000,
+      maxElementSizeBytes: 2_000_000,
+    },
+  );
 };
 
 describe("BNTP v2 Normal — D.2c.1 adversarial coverage (path 1 conservation half)", () => {

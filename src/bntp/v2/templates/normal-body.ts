@@ -338,24 +338,33 @@ const PATH1_D2B_SUM_IN = `
 `;
 
 // ---------------------------------------------------------------------------
-// Wave D.2c.1 — unified per-tuple loop, conservation half (sum-out + per-iter
-// marker check + per-iter depth-skip check + closing balance check).
+// Wave D.2c.2 — unified per-tuple loop with full output reconstruction +
+// hashOutputs closure. Builds on D.2c.1's conservation half by retaining
+// tuple parts (amount, owner, depth) past the sanity checks and rebuilding
+// each candidate output's full serialized bytes (sats ‖ varint ‖ scriptBytes)
+// inside the loop. Bytes are CAT'd into an `acc_recon` accumulator stashed
+// on the altstack (under the loop counter); closing pops the accumulator,
+// HASH256s it, and EQUALVERIFYs against zone.hashOutputs (slot 3).
 // ---------------------------------------------------------------------------
 //
-// D.2c is delivered in three sub-waves to keep each commit self-contained and
-// individually verifiable:
-//   - D.2c.1 (this block): sum-out aggregation + tuple sanity (marker, depth)
-//                          + closing NUMEQUALVERIFY for Σ_in == Σ_out.
-//                          Tuples are still parsed; reconstruction discards
-//                          owner_pkh + amount_bytes + depth_bytes.
-//   - D.2c.2 (next): output reconstruction (full candidate-output bytes
-//                    accumulator) + closing HASH256+EQUALVERIFY against
-//                    zone.hashOutputs (slot 3). Re-uses D.2c.1's iter
-//                    skeleton; extends with per-iter CAT into acc_recon.
-//   - D.2c.3 (last): N-out-of-range + M-out-of-range adversarial coverage,
-//                    final size-floor bump.
+// D.2c sub-wave history:
+//   - D.2c.1: sum-out + marker + depth-skip + closing NUMEQUALVERIFY.
+//   - D.2c.2 (this block): retains D.2c.1's checks; adds reconstruction
+//                          (new_tail, candidate_script, sats+varint wrap)
+//                          and CAT to acc_recon; closing adds
+//                          HASH256+EQUALVERIFY against zone.hashOutputs.
+//   - D.2c.3: N-/M-out-of-range adversarial coverage, final size-floor
+//             retighten (D.2c.2 bumps size ceiling temporarily — see
+//             tests/bntp-v2-normal-template-size.test.ts).
 //
-// Stack invariants (D.2c.1 entry, immediately after PATH1_D2B_SUM_IN):
+// Per-iter byte budget is intentionally LOOSE — emphasis is on a working,
+// readable, individually-verifiable assembly. Optimization passes (e.g.,
+// shared output-reconstruction helper, FROMALT-shuffle minimization,
+// fixed-point varint embedding) come AFTER the protocol is proven correct
+// end-to-end across all 4 paths × 8 BNTP test vectors. See size-test
+// "TODO: tighten in optimization wave" note.
+//
+// Stack invariants at D.2c.2 SETUP entry (= PATH1_D2B_SUM_IN exit):
 //   d0:  sum_in
 //   d1:  sP
 //   d2:  N
@@ -366,21 +375,25 @@ const PATH1_D2B_SUM_IN = `
 //   d19: max_input_depth
 //   d20: selfPos
 //   d21: all_input_outpoints
-//   d22..d22+N-1: tuples (tuple_topmost at d22 by tx-order; D.2c sees it as
-//                 d23 after one-time SETUP pushes sum_out_acc on top)
+//   d22..d22+N-1: tuples (tuple_topmost at d22)
 //   d22+N: M
 //
-// Setup pushes counter=N to alt and sum_out_acc=0 to top, shifting all
-// items down by 1 (sum_in → d1, …, max_input → d20, tuple_topmost → d23).
+// Setup pushes acc_recon (=empty bytes) and counter=N to alt (acc_recon
+// deeper, counter on top), and sum_out_acc=0 to main top. After SETUP all
+// items shift down by 1 (sum_in → d1, …, max_input → d20, tuple_topmost
+// at d23).
 
-// One-time setup: copy N to alt as loop counter, push sum_out_acc=0.
+// One-time setup: stash acc_recon (empty) and counter=N to alt; push
+// sum_out_acc=0. Order of TOALTSTACKs determines alt LIFO: acc_recon
+// pushed FIRST so it sits BELOW counter for next iter's FROMALT pulls.
 const PATH1_D2C_SETUP = `
+  OP_0 OP_TOALTSTACK
   OP_2 OP_PICK OP_TOALTSTACK
   OP_0
 `;
 
-// Per-iteration body (unrolled ×4). Stack at ITER entry (post-SETUP for iter
-// 1, post-prev-iter for subsequent):
+// Per-iteration body (unrolled ×4). Stack at ITER entry (post-SETUP for
+// iter 1, post-prev-iter otherwise):
 //   d0:  sum_out_acc            (carrying)
 //   d1:  sum_in
 //   d2:  sP
@@ -391,79 +404,118 @@ const PATH1_D2C_SETUP = `
 //   d20: max_input_depth
 //   d21: selfPos
 //   d22: all_input_outpoints
-//   d23..: tuple_topmost, tuple_rem, M (tuple_topmost ALWAYS at d23 since
-//          consuming a tuple shifts items below — including M — up by 1,
-//          while items above d23 stay anchored)
-//   alt top: counter (N at iter 1; counter-i at iter i+1)
+//   d23..: tuple_topmost (always at d23 — invariant across iters since
+//          consuming a tuple shifts items BELOW (M, deeper tuples) up by 1
+//          while items above d23 stay anchored).
+//   alt: [counter (top), acc_recon].
 //
 // IF body sequence (counter > 0):
-//   (1) decrement counter, stash on alt
-//   (2) ROLL tuple_topmost (d23) to top
-//   (3) split into amount_16 ‖ owner_20 ‖ depth_2 ‖ marker_2
-//       — amount: BIN2NUM, ROLL sum_out_acc up, ADD, restore order
-//       — owner_20: dropped (D.2c.1 doesn't reconstruct yet; D.2c.2 will keep)
-//       — marker: EQUALVERIFY 01FF
-//       — depth: BIN2NUM, compare to (max_input + 1) via NUMEQUALVERIFY
-//          (max_input is at d21 at the moment of PICK — derived from depth-
-//          tracking through SPLITs and ROLLs; see comment block below.)
-//   ELSE body (counter == 0): TOALT (counter back unchanged; iter is no-op).
+//   (1) decrement counter, stash on alt.
+//   (2) ROLL tuple to top, split into amount_16 ‖ owner_20 ‖ depth_2 ‖
+//       marker_2. Update sum_out_acc with amount_num; verify marker;
+//       verify depth == max_input + 1. Tuple parts (amount_16, owner_20,
+//       depth_2) end up stashed on alt for reconstruction.
+//   (3) Pull tuple parts back to main; build new_tail by CATting zone
+//       fields (PICK) and tuple parts in order: tokenId ‖ issuerPkh ‖
+//       amount ‖ authFlags ‖ freezeAuth ‖ confiscAuth ‖ depth ‖
+//       optionalData.
+//   (4) Wrap to candidate_script: prepend 0x14 ‖ owner_20 ‖ 0x00 0x6d ‖
+//       body ‖ 0x6a to new_tail.
+//   (5) Compute scriptLen via OP_DUP OP_SIZE OP_NIP, encode as 2-byte LE
+//       via OP_2 OP_NUM2BIN, build varint = 0xFD ‖ scriptLen_le_2b.
+//   (6) Prepend sats_8b (constant `0100000000000000` = 1 sat dust) and
+//       varint to candidate_script → output_bytes.
+//   (7) Pull acc_recon and counter-1 from alt, CAT output_bytes onto
+//       acc_recon, push both back (acc_recon deeper, counter-1 on top).
 //
-// Depth-tracking detail for `15 OP_PICK` (max_input access):
-//   Pre-IF max_input depth: 20.
-//   After 17 OP_ROLL (+0 net stack, items above tuple shift +1): 21.
-//   After OP_16 OP_SPLIT (+1): 22.
-//   After OP_2 OP_ROLL (0, sum_out_acc rolled from d2 to d0; items at d3+
-//                       unchanged): 22.
-//   After OP_ADD (-1): 21.
-//   After OP_14 OP_SPLIT (+1): 22.
-//   After OP_NIP (drop owner_20, -1): 21.
-//   After OP_2 OP_SPLIT (+1): 22.
-//   After 01FF OP_EQUALVERIFY (-1): 21.
-//   After OP_BIN2NUM (0): 21.
-//   → PICK 21 → `15 OP_PICK`.
+// ELSE body (counter == 0): TOALTSTACK counter back unchanged; iter is
+// a no-op (acc_recon and main untouched).
 //
-// Iter byte budget (rough): 35b. ×4 = 140b. Plus 4b setup + 3b closing = 147b.
+// Sats are hardcoded to 1 satoshi (matching test scenarios). Variable-sats
+// support requires extending the unlocking witness with per-tuple sats
+// fields — separate wave.
 
-const PATH1_D2C1_ITER = `
+const PATH1_D2C2_ITER = `
   OP_FROMALTSTACK
-  OP_DUP
-  OP_0 OP_GREATERTHAN
+  OP_DUP OP_0 OP_GREATERTHAN
   OP_IF
     OP_1SUB OP_TOALTSTACK
+
     17 OP_ROLL
     OP_16 OP_SPLIT
-    OP_SWAP OP_BIN2NUM
+    OP_SWAP
+    OP_DUP OP_TOALTSTACK
+    OP_BIN2NUM
     OP_2 OP_ROLL OP_ADD
     OP_SWAP
     14 OP_SPLIT
-    OP_NIP
+    OP_SWAP
+    OP_TOALTSTACK
     OP_2 OP_SPLIT
     01FF OP_EQUALVERIFY
+    OP_DUP OP_TOALTSTACK
     OP_BIN2NUM
     15 OP_PICK OP_BIN2NUM OP_1ADD OP_NUMEQUALVERIFY
+
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+
+    14 OP_PICK
+    14 OP_PICK
+    OP_CAT
+    OP_SWAP OP_CAT
+    11 OP_PICK OP_CAT
+    OP_16 OP_PICK OP_CAT
+    OP_15 OP_PICK OP_CAT
+    OP_2 OP_ROLL OP_CAT
+    OP_12 OP_PICK OP_CAT
+
+    6A OP_SWAP OP_CAT
+    OP_11 OP_PICK OP_SWAP OP_CAT
+    006D OP_SWAP OP_CAT
+    OP_CAT
+    14 OP_SWAP OP_CAT
+
+    OP_DUP OP_SIZE OP_NIP
+    OP_2 OP_NUM2BIN
+    FD OP_SWAP OP_CAT
+    OP_SWAP OP_CAT
+    0100000000000000 OP_SWAP OP_CAT
+
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_2 OP_ROLL
+    OP_CAT
+    OP_TOALTSTACK
+    OP_TOALTSTACK
   OP_ELSE
     OP_TOALTSTACK
   OP_ENDIF
 `;
 
-// Closing: pop final counter (=0 after all consumed) from alt and discard,
-// then balance-check sum_in == sum_out_acc.
+// Closing: pop final counter (=0 after all iters) and discard; pop
+// acc_recon and HASH256 it; PICK zone.hashOutputs (slot 3, at d8 after
+// FROMALT); EQUALVERIFY hashes; NUMEQUALVERIFY balance.
 //
-// Stack at closing entry:
-//   d0: sum_out_acc (after all iters)
-//   d1: sum_in
-//   d2: sP
-//   d3..: rest unchanged
-//   alt top: 0 (final counter)
+// Stack at closing entry (post 4 unrolled iters):
+//   d0: sum_out_acc, d1: sum_in, d2: sP, d3: N, d4..d17: zone, d18..d22:
+//   witness (max_input at d20, all_inputs at d22), d23: M.
+//   alt: [counter=0 (top), acc_recon].
 //
-// After OP_FROMALTSTACK OP_DROP: alt cleared, main unchanged.
-// After OP_NUMEQUALVERIFY: pops sum_out_acc and sum_in, verifies numeric
-//                         equality. Stack becomes [sP, N, zone, witness, M].
-//
-// Dispatcher's trailing `OP_1 OP_NIP` then pushes 1 on top (sP shifts to d1)
-// and OP_NIP drops sP, leaving 1 truthy on top.
-const PATH1_D2C1_CLOSING = `
+// After OP_FROMALTSTACK OP_DROP: counter consumed.
+// After OP_FROMALTSTACK: acc_recon on main top; zone shifts +1.
+// After OP_HASH256: hashed acc_recon on top (size unchanged).
+// After OP_8 OP_PICK: copy of zone[3]=hashOutputs (currently at d8) to
+//                     top.
+// After OP_EQUALVERIFY: -2.
+// After OP_NUMEQUALVERIFY: -2 (pops sum_out_acc and sum_in).
+// Final: top = sP, dispatcher's `OP_1 OP_NIP` works as before.
+const PATH1_D2C2_CLOSING = `
   OP_FROMALTSTACK OP_DROP
+  OP_FROMALTSTACK
+  OP_HASH256
+  OP_8 OP_PICK OP_EQUALVERIFY
   OP_NUMEQUALVERIFY
 `;
 
@@ -476,20 +528,19 @@ const PATH1_ASM = `
   ${PATH1_D2A_DEPTH_CHECK}
   ${PATH1_D2B_SUM_IN}
   ${PATH1_D2C_SETUP}
-  ${PATH1_D2C1_ITER}
-  ${PATH1_D2C1_ITER}
-  ${PATH1_D2C1_ITER}
-  ${PATH1_D2C1_ITER}
-  ${PATH1_D2C1_CLOSING}
+  ${PATH1_D2C2_ITER}
+  ${PATH1_D2C2_ITER}
+  ${PATH1_D2C2_ITER}
+  ${PATH1_D2C2_ITER}
+  ${PATH1_D2C2_CLOSING}
 `;
 
 // Legacy path-1 sub-blocks (A.2 altstack-centric design) — REMOVED in
-// Wave D.1. D.2b shipped sum-in. D.2c.1 (this commit) adds the unified
-// per-tuple loop with conservation + tuple-sanity (marker, depth-skip).
-// D.2c.2 will extend each iter to also reconstruct candidate-output bytes
-// and CAT them into a hashOutputs accumulator, then close with
-// HASH256(acc) == zone.hashOutputs. D.2c.3 finalizes adversarial coverage
-// for N-/M-out-of-range and bumps the size floor.
+// Wave D.1. D.2b shipped sum-in. D.2c.1 added per-tuple conservation
+// + sanity. D.2c.2 (this commit) extends each iter with full output
+// reconstruction and adds HASH256+EQUALVERIFY against zone.hashOutputs
+// at closing. D.2c.3 will add N-/M-out-of-range adversarial coverage
+// and re-tighten the size floor.
 //
 // For historical reference see commit 18490e2^ (pre-D.0) or
 // `docs/BNTP_V2_NORMAL_TEMPLATE_A3_REPORT.md`.

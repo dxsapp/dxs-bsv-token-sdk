@@ -98,15 +98,21 @@ describe("BNTP v2 Normal template — body size (A.1.1 + A.2 + A.2.5 + A.3)", ()
     expect(verdict).not.toBe("ABORT");
   });
 
-  test("body size is above regression floor (≥ 1200b)", () => {
-    // Sanity lower bound. A value below this indicates a major section was
-    // elided (covenant, preimage parse, dispatcher, etc.).
+  test("body size is above regression floor (≥ 1900b)", () => {
+    // Sanity lower bound. A value below this indicates a major section
+    // (covenant, preimage parse, dispatcher, path-1 SUFFIX) was elided.
     //
-    // Floor temporarily relaxed from 1500b → 1200b for Wave D.1: path 1
-    // suffix is stubbed out pending D.2 (PICK-zone rewrite). Current
-    // D.1 measurement: 1442b. D.2 will restore it to the ~2600b band
-    // and the floor should move back to 2000b+.
-    expect(NORMAL_BODY_SIZE).toBeGreaterThanOrEqual(1200);
+    // History:
+    //   - Phase 1A: 2620b (PIVOT band).
+    //   - Wave D.1 (PREFIX rewrite, path-1 stubbed): 1442b.
+    //   - Wave D.2c.1 (path-1 conservation half): 1767b.
+    //   - Wave D.2c.2 (path-1 reconstruction + hashOutputs): 2098b.
+    //   - Wave D.2c.3 (this commit): floor bumped 1200 → 1900 to lock
+    //     in the post-D.2c.2 baseline. The optimization wave (post end-
+    //     to-end Phase 1B execution proof) will revisit and likely
+    //     trim 200-400b, after which the floor should move back down
+    //     in lockstep with the new ASM compaction.
+    expect(NORMAL_BODY_SIZE).toBeGreaterThanOrEqual(1900);
   });
 
   test("per-section sizes sum to total body size", () => {

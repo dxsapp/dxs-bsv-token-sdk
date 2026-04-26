@@ -368,12 +368,46 @@ export const prefixOwnerAndZoneAsm = (bodySize: number): string => {
 // Output serialization helper — FD-only varint (candidate scripts always
 // land in [0xFD..0xFFFF] range per decision #38; single-branch saves ~120b
 // vs 3-branch generic varint per A.2.5 retro-opt).
+//
+// Pre-state (top-first): [C, X]
+//   - C = candidate locking-script bytes (the locking script being committed).
+//   - X = "below" accumulator (allows multi-output composition; for single-
+//         output paths X is just the empty bytes left below by setup).
+//
+// Post-state (top-first): [X ‖ sats(8) ‖ FD ‖ size_le_2b ‖ C]
+//   - sats(8) = `0100000000000000` (1 satoshi LE per BNTP v2 dust convention)
+//   - varint  = 0xFD ‖ size_le_2b (BSV varint for [0xFD..0xFFFF])
+//
+// Phase 1B audit (Wave D.2c-trailer): the original Phase 1A implementation
+// produced `X ‖ C ‖ FD ‖ 0100 ‖ size_C_scriptnum` — wrong byte order AND a
+// hardcoded `0100` literal (the first 2 bytes of the sats-1 push) used in
+// place of size_le_2b. The bug was masked because paths 2/3/4 are dead code
+// in the D.1 dispatcher (only path_id=1 is exercised end-to-end via the
+// D.2c pipeline). See tests/bntp-v2-shared-prefix-varint-audit.test.ts for
+// the standalone correctness contract; the post-fix implementation mirrors
+// the verified D.2c.2 inline reconstruction in normal-body.ts.
+//
+// Implementation walks:
+//   OP_DUP OP_SIZE OP_NIP   : extract size_C as scriptnum (top, leaves C+X below)
+//   OP_2 OP_NUM2BIN         : encode size as exactly 2-byte LE
+//   FD OP_SWAP OP_CAT       : prepend FD → varint = FD ‖ size_le_2b
+//   OP_SWAP OP_CAT          : prepend varint to C → varint ‖ C
+//   <sats> OP_SWAP OP_CAT   : prepend sats(8) → sats ‖ varint ‖ C
+//   OP_CAT                  : prepend X (consume final stack item below) →
+//                             X ‖ sats ‖ varint ‖ C
+//
+// Byte budget unchanged from Phase 1A helper (23b → 23b); correctness
+// rectified. NUM2BIN(2) requires scriptLen ≤ 32767 (signed scriptnum
+// fits in 2 bytes); BNTP candidate scripts are well within this bound
+// (~2000-3000b for the Normal template). Magnetic-opcodes flag must be
+// set in the script eval context (it is — see DEFAULT_FLAGS).
 export const VARINT_SERIALIZE_ASM = `
-  0100000000000000 OP_SWAP
-  OP_SIZE OP_SWAP
-  OP_ROT OP_SWAP
-  FD OP_CAT OP_SWAP OP_2 OP_SPLIT OP_DROP OP_CAT
-  OP_SWAP OP_CAT OP_CAT
+  OP_DUP OP_SIZE OP_NIP
+  OP_2 OP_NUM2BIN
+  FD OP_SWAP OP_CAT
+  OP_SWAP OP_CAT
+  0100000000000000 OP_SWAP OP_CAT
+  OP_CAT
 `;
 
 // Generic authority identity + CHECKSIG(VERIFY) block.

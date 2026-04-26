@@ -123,7 +123,10 @@ describe("BNTP v2 Normal — D.2c.2 adversarial coverage (hashOutputs commitment
       m: 1,
       outputTuples: [malformedTuple],
       amountsInArray: uint128LE(scenario.amount),
-      allInputOutpoints: outpointBytes(scenario.inputTxIdBE, scenario.inputVout),
+      allInputOutpoints: outpointBytes(
+        scenario.inputTxIdBE,
+        scenario.inputVout,
+      ),
       selfPosition: scenario.selfPosition,
       maxInputDepth: scenario.maxInputDepth,
       nullData: new Uint8Array(),
@@ -155,19 +158,24 @@ describe("BNTP v2 Normal — D.2c.2 adversarial coverage (hashOutputs commitment
       { lockingScript: a.inputLockingScript, satoshis: scenario.inputSatoshis },
     ];
 
-    const r = evaluateScripts(unlockingScript, a.inputLockingScript, {
-      tx,
-      inputIndex: 0,
-      prevOutputs,
-    }, {
-      allowOpReturn: true,
-      scriptFlags: FLAGS,
-      strict: false,
-      maxScriptSizeBytes: 2_000_000,
-      maxOps: 100_000,
-      maxStackDepth: 10_000,
-      maxElementSizeBytes: 2_000_000,
-    });
+    const r = evaluateScripts(
+      unlockingScript,
+      a.inputLockingScript,
+      {
+        tx,
+        inputIndex: 0,
+        prevOutputs,
+      },
+      {
+        allowOpReturn: true,
+        scriptFlags: FLAGS,
+        strict: false,
+        maxScriptSizeBytes: 2_000_000,
+        maxOps: 100_000,
+        maxStackDepth: 10_000,
+        maxElementSizeBytes: 2_000_000,
+      },
+    );
     expect(r.success).toBe(false);
     expect(r.error).toBeDefined();
   });

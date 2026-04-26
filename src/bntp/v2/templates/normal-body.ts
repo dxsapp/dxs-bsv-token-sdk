@@ -305,7 +305,10 @@ const PATH1_D2A_DEPTH_CHECK = `
 // 15 OP_ROLL: pull amounts (at top-depth 21 for our stack state at D.2b
 //             entry) to top. Depth 0x15=21 matches §2 zone(14)+sP+N+witness
 //             layout where amounts_in_array sits at that slot.
-// OP_0      : initial sum_in acc = 0 on top.
+// OP_0 OP_SWAP: push acc=0 then swap so iter invariant holds — amounts on
+//             top, acc below. (D.2b shipped without OP_SWAP; first DUP/SIZE
+//             then read size of acc=0 → IF predicate always false, iter no-op.
+//             Fixed in D.2c.0.5.)
 //
 // Per iter: DUP/SIZE/NIP yields `|amounts_rem|`. If >0, OP_16 OP_SPLIT
 // extracts the next 16-byte amount; OP_BIN2NUM decodes it as a scriptnum;
@@ -326,7 +329,7 @@ const PATH1_D2B_SUM_IN_ITER = `
 
 const PATH1_D2B_SUM_IN = `
   15 OP_ROLL
-  OP_0
+  OP_0 OP_SWAP
   ${PATH1_D2B_SUM_IN_ITER}
   ${PATH1_D2B_SUM_IN_ITER}
   ${PATH1_D2B_SUM_IN_ITER}

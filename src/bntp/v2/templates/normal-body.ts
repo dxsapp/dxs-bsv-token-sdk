@@ -334,56 +334,6 @@ const PATH1_D2B_SUM_IN = `
   OP_DROP
 `;
 
-// --- Sum-out loop (setup + 4 iters + cleanup) ---
-//
-// OP_0              : initial sum_out acc = 0 on top.
-// OP_3 OP_PICK      : copy N (depth 3 post-push) to top.
-// OP_TOALTSTACK     : stash as loop counter on altstack.
-//
-// Per iter: FROMALT counter, DUP, `>0` guard.
-//   IF  : 1SUB then TOALT (put counter-1 back); DEPTH-2 ROLL pulls the
-//         topmost tuple to top; OP_16 OP_SPLIT OP_DROP keeps the left-16b
-//         (amount field); OP_BIN2NUM + OP_ADD folds into acc.
-//   ELSE: TOALT puts the counter (already 0) back, nothing to do.
-//
-// Cleanup: FROMALT / DROP discards the final counter.
-
-const PATH1_D2B_SUM_OUT_ITER = `
-  OP_FROMALTSTACK
-  OP_DUP
-  OP_0 OP_GREATERTHAN
-  OP_IF
-    OP_1SUB
-    OP_TOALTSTACK
-    OP_DEPTH OP_2 OP_SUB OP_ROLL
-    OP_16 OP_SPLIT OP_DROP
-    OP_BIN2NUM
-    OP_ADD
-  OP_ELSE
-    OP_TOALTSTACK
-  OP_ENDIF
-`;
-
-const PATH1_D2B_SUM_OUT = `
-  OP_0
-  OP_3 OP_PICK
-  OP_TOALTSTACK
-  ${PATH1_D2B_SUM_OUT_ITER}
-  ${PATH1_D2B_SUM_OUT_ITER}
-  ${PATH1_D2B_SUM_OUT_ITER}
-  ${PATH1_D2B_SUM_OUT_ITER}
-  OP_FROMALTSTACK OP_DROP
-`;
-
-// --- Balance check: Σ_in == Σ_out ---
-//
-// Both are minimal-encoded scriptnums produced by OP_ADD (accumulator of
-// BIN2NUM results). OP_NUMEQUALVERIFY asserts numeric equality, aborting
-// on mismatch. Consumes both values from top.
-const PATH1_D2B_BALANCE_CHECK = `
-  OP_NUMEQUALVERIFY
-`;
-
 const PATH1_ASM = `
   ${PATH1_D2A_HASH_PREVOUTS_BIND}
   ${PATH1_D2A_N_DERIVE_AND_AMOUNTS_LEN}
@@ -392,13 +342,14 @@ const PATH1_ASM = `
   ${PATH1_D2A_M_RANGE}
   ${PATH1_D2A_DEPTH_CHECK}
   ${PATH1_D2B_SUM_IN}
-  ${PATH1_D2B_SUM_OUT}
-  ${PATH1_D2B_BALANCE_CHECK}
 `;
 
 // Legacy path-1 sub-blocks (A.2 altstack-centric design) — REMOVED in
-// Wave D.1. D.2b will add sum-in/sum-out loops (consumes sP and N); D.2c
-// will add output reconstruction ×N with hashOutputs closure.
+// Wave D.1. D.2b shipped sum-in (consumes amounts_in_array). Sum-out was
+// initially shipped in D.2b but reverted (D.2c.0) so D.2c can fuse sum-out
+// with output reconstruction in a single per-tuple pass — saves a second
+// 4-iter loop and avoids touching tuples twice. D.2c will add output
+// reconstruction ×N with hashOutputs closure + balance check.
 //
 // For historical reference see commit 18490e2^ (pre-D.0) or
 // `docs/BNTP_V2_NORMAL_TEMPLATE_A3_REPORT.md`.

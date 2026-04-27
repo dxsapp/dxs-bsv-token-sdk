@@ -7,6 +7,7 @@ import {
   PREIMAGE_PARSE_ASM,
   prefixZoneAsm,
   OWNER_IDENTITY_CHECK_ASM,
+  authIdentityCheckPkhAsm,
   tailCacheAsm,
   VARINT_SERIALIZE_ASM,
   authorityIdentityAsm,
@@ -798,52 +799,139 @@ export const PATH3_FREEZE_ASM = `
 `;
 
 // ---------------------------------------------------------------------------
-// §4.4 Path 4 — confiscate SUFFIX (spec §9.5)
+// §4.4 Path 4 — confiscate SUFFIX (spec §9.5) — Wave D.3.1 rewrite
 // ---------------------------------------------------------------------------
 // Produces exactly 1 Normal output with amount preserved, owner = new_owner
 // (authority chooses, supplied via output_tuple), new_depth = my_depth
 // (PRESERVED — per Step C Critical #1 / decision #39). Confiscate is a pure
-// ownership change and MUST NOT reset attestation_depth; the rolling-freshness
-// invariant (§6.3) is maintained by inheriting the source UTXO's depth so that
-// `depth = 0` unambiguously implies issuer attestation. Symmetric with freeze.
-// Prior-draft behavior (0000 literal) is rejected. Same-template reconstruction
-// reuses body_before_tail cache from §3.5 — no h_X push needed.
+// ownership change and MUST NOT reset attestation_depth.
+//
+// Rewrite scope (D.3.1):
+//   - Adapted to D.1 main-stack zone contract (was legacy A.2 altstack-
+//     centric — full rewrite from scratch).
+//   - Pre/post-state matches the dispatcher contract: path_id (=4) on top
+//     at entry, path_id on top at exit (dispatcher's `OP_1 OP_NIP` handles
+//     the rest).
+//   - PKH-only confiscAuth; MPKH branch deferred to a follow-up wave.
+//   - Loose-bytes posture (mirrors D.2c.2 inline reconstruction); no shared
+//     output-bytes helper yet — optimization wave will extract it.
+//
+// Pre-state (PATH4_CONFISCATE_ASM entry):
+//   d0:  path_id (=4)
+//   d1:  hashPrev
+//   d2:  thisOut
+//   d3:  hashOutputs
+//   d4:  owner_pkh        (existing owner being confiscated FROM —
+//                          unused in path 4 logic but kept in zone)
+//   d5:  body
+//   d6:  optionalData
+//   d7:  depth (zone) — "my_depth", preserved on confiscation
+//   d8:  confiscAuth
+//   d9:  freezeAuth
+//   d10: authFlags
+//   d11: amount (zone) — "my_amount", preserved on confiscation
+//   d12: issuerPkh
+//   d13: tokenId
+//   d14: pubkey (confiscAuth's; consumed by `authIdentityCheckPkhAsm(8)`)
+//   d15: sig (confiscAuth's; consumed by `authIdentityCheckPkhAsm(8)`)
+//   d16: funding_outpoint (may be empty)
+//   d17: output_tuple (40b: amount16 ‖ newOwner20 ‖ depth2 ‖ marker2)
+//
+// Verification rules (per spec §9.5):
+//   1. authFlags bit 1 set (confiscatable enabled): `authFlags & 0x02 == 0x02`
+//   2. confiscAuth signature valid: HASH160(pubkey) == zone.confiscAuth +
+//      CHECKSIGVERIFY (PKH-only for now)
+//   3. Output[0]:
+//      - amount = zone.amount (preserved)
+//      - new_depth = zone.depth (preserved per Step C decision #39)
+//      - marker = 0x01FF (Normal output marker)
+//      - owner = new_owner (from tuple; no validation, used in reconstruction)
+//      - all other tail fields preserved from zone
+//   4. HASH256(reconstructed_output_bytes) == zone.hashOutputs
+//
+// Post-state: path_id on top, zone-13 below, original layout below path_id.
+// Dispatcher's `OP_1 OP_NIP` then drops path_id leaving truthy sentinel.
+//
+// Sats are hardcoded to 1 satoshi (matching test scenarios and the BNTP v2
+// dust convention; see VARINT_SERIALIZE_ASM rationale).
+
+// Step-by-step depth annotations:
+//
+// After PATH4 entry + step 1 (auth flag) + step 2 (auth identity check):
+//   main = [path_id(d0), zone(d1-d13), funding(d14), tuple(d15)]
+//
+// After OP_15 OP_ROLL (tuple to top):
+//   main = [tuple(d0), path_id(d1), zone(d2-d14), funding(d15)]
+//
+// After OP_16 OP_SPLIT OP_SWAP (parse amount):
+//   main = [amount_16(d0), right_24(d1), path_id(d2), zone(d3-d15), funding(d16)]
+//   amount(zone) at d13 (was d11 + 2 shift).
+//
+// After OP_13 OP_PICK OP_EQUALVERIFY (verify amount == zone.amount):
+//   main = [right_24(d0), path_id(d1), zone(d2-d14), funding(d15)]
+//
+// After 14 OP_SPLIT OP_SWAP + size-check + OP_TOALTSTACK (extract owner_20
+// to alt) + OP_2 OP_SPLIT 01FF OP_EQUALVERIFY (marker):
+//   main = [depth_2(d0), path_id(d1), zone(d2-d14), funding(d15)]
+//   alt = [owner_20]
+//
+// After OP_8 OP_PICK OP_EQUALVERIFY (verify depth == zone.depth):
+//   main = [path_id(d0), zone(d1-d13), funding(d14)]
+//   alt = [owner_20]
+//
+// new_tail build via 8-field PICK ladder: zone[i] at d_i throughout.
+// candidate_script wrap via 5 prepends: body at zone[5] = d5 throughout.
+// Final HASH256 + EQUALVERIFY against zone.hashOutputs at zone[3] = d4
+// (after candidate has been built and consumed).
 export const PATH4_CONFISCATE_ASM = `
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  02 OP_AND 02 OP_EQUALVERIFY
+  OP_10 OP_PICK
+  02 OP_AND
+  02 OP_EQUALVERIFY
 
-  ${authorityIdentityAsm("08")}
+  ${authIdentityCheckPkhAsm(8)}
 
-  OP_DEPTH OP_2 OP_SUB OP_PICK
-  10 OP_SPLIT
-  OP_OVER OP_BIN2NUM OP_0 OP_GREATERTHAN OP_VERIFY
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  00 OP_CAT OP_BIN2NUM
-  OP_OVER OP_BIN2NUM OP_EQUALVERIFY
-  OP_DROP
-  OP_SWAP OP_TOALTSTACK
-  14 OP_SPLIT OP_SWAP
+  OP_15 OP_ROLL
+  OP_16 OP_SPLIT
+  OP_SWAP
+
+  OP_13 OP_PICK
+  OP_EQUALVERIFY
+
+  14 OP_SPLIT
+  OP_SWAP
   OP_DUP OP_SIZE OP_NIP 14 OP_NUMEQUALVERIFY
   OP_TOALTSTACK
-  OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
+
+  OP_2 OP_SPLIT
   01FF OP_EQUALVERIFY
-  OP_FROMALTSTACK
-  14 OP_CAT
-  006D OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  6A OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  ${VARINT_SERIALIZE_ASM}
+
+  OP_8 OP_PICK
+  OP_EQUALVERIFY
+
+  OP_13 OP_PICK
+  OP_13 OP_PICK
+  OP_CAT
+  OP_12 OP_PICK OP_CAT
+  OP_11 OP_PICK OP_CAT
+  OP_10 OP_PICK OP_CAT
+  OP_9 OP_PICK OP_CAT
+  OP_8 OP_PICK OP_CAT
+  OP_7 OP_PICK OP_CAT
+
+  6A OP_SWAP OP_CAT
+  OP_6 OP_PICK OP_SWAP OP_CAT
+  006D OP_SWAP OP_CAT
+  OP_FROMALTSTACK OP_SWAP OP_CAT
+  14 OP_SWAP OP_CAT
+
+  OP_DUP OP_SIZE OP_NIP
+  OP_2 OP_NUM2BIN
+  FD OP_SWAP OP_CAT
+  OP_SWAP OP_CAT
+  0100000000000000 OP_SWAP OP_CAT
 
   OP_HASH256
-  OP_FROMALTSTACK OP_EQUALVERIFY
+  OP_4 OP_PICK OP_EQUALVERIFY
 `;
 
 // ---------------------------------------------------------------------------

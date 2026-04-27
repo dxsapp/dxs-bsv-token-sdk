@@ -439,6 +439,55 @@ export const prefixZoneAsm = (bodySize: number): string => {
   `;
 };
 
+// Generalized PKH identity check for paths that consume pubkey + sig from
+// depths 14 / 15 (the post-`prefixZoneAsm` slot for the unlocking witness's
+// pubkey + sig pair) and verify HASH160(pubkey) == zone[zoneSlot] +
+// CHECKSIGVERIFY. Used in:
+//   - path 1 / 2 SUFFIX: zoneSlot = 4 (zone[4] = owner_pkh)
+//   - path 4 SUFFIX:    zoneSlot = 8 (zone[8] = confiscAuth)
+//   - path 3 SUFFIX:    zoneSlot = 9 (zone[9] = freezeAuth)
+//
+// Pre-state (post-`prefixZoneAsm`):
+//   main top-down = [path_id, hashPrev, thisOut, hashOut, owner_pkh, body,
+//                    optData, depth, confiscAuth, freezeAuth, authFlags,
+//                    amount, issuerPkh, tokenId, pubkey, sig, ...witness]
+// Post-state:
+//   main top-down = [path_id, ...zone (13)..., ...witness]   (pubkey + sig
+//                                                              consumed)
+//
+// Sequence:
+//   OP_14 OP_ROLL              : pubkey (d14) → top
+//   OP_DUP OP_HASH160          : push hash160(pubkey)
+//   OP_<zoneSlot+2> OP_PICK    : copy zone[zoneSlot] (now at depth zoneSlot+2
+//                                because of pubkey on top + DUP + HASH160 net +2)
+//   OP_EQUALVERIFY             : verify hash == zone[zoneSlot]
+//   OP_15 OP_ROLL OP_SWAP      : sig → top, swap pubkey to top
+//                                (CHECKSIG pops pubKey first — see eval)
+//   OP_CHECKSIGVERIFY
+//
+// Byte budget: 11b. Correctness rationale for OP_<zoneSlot+2> picking the
+// right slot: after `OP_14 OP_ROLL OP_DUP OP_HASH160`, items 0..13 (= zone)
+// have shifted +2 in depth (one for ROLL pulling pubkey above them, one
+// for DUP on top). The OP_PICK then takes from the post-shift depth.
+//
+// For zoneSlot ∈ {4, 8, 9} (owner_pkh, confiscAuth, freezeAuth) the
+// resulting pick depth is 6, 10, 11 — all in the 1-byte OP_N range.
+export const authIdentityCheckPkhAsm = (zoneSlot: number): string => {
+  if (zoneSlot < 0 || zoneSlot > 13)
+    throw new Error(`zoneSlot must be 0..13, got ${zoneSlot}`);
+  const pickDepth = zoneSlot + 2;
+  if (pickDepth < 1 || pickDepth > 16)
+    throw new Error(`pickDepth ${pickDepth} out of OP_N range`);
+  return `
+    OP_14 OP_ROLL
+    OP_DUP OP_HASH160
+    OP_${pickDepth} OP_PICK OP_EQUALVERIFY
+    OP_15 OP_ROLL
+    OP_SWAP
+    OP_CHECKSIGVERIFY
+  `;
+};
+
 // Owner-identity check (PKH-only) for path 1 (flex-transfer) and path 2
 // (refresh) SUFFIX entry. Consumes pubkey and sig from depths 14/15
 // (inserted by `prefixZoneAsm`), restoring the legacy `prefixOwnerAndZoneAsm`

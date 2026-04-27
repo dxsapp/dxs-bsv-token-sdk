@@ -1,4 +1,7 @@
 import { asmToBytes } from "../../../script/build/asm-template-builder";
+import { sha256 } from "../../../hashes";
+import { toHex } from "../../../bytes";
+import { FROZEN_BODY_BYTES } from "./frozen-body";
 import {
   COVENANT_PREIMAGE_ROLL_ASM,
   COVENANT_S_PREAMBLE_ASM,
@@ -740,62 +743,141 @@ export const PATH2_REFRESH_ASM = `
 `;
 
 // ---------------------------------------------------------------------------
-// §4.3 Path 3 — freeze SUFFIX (spec §9.4)
+// §4.3 Path 3 — freeze SUFFIX (spec §9.4) — Wave D.3.2 rewrite
 // ---------------------------------------------------------------------------
-// Produces exactly 1 Frozen output with amount / owner / new_depth all
-// preserved byte-exact from source. Unlocking pushes `frozen_body_bytes`
-// (~700b); locking verifies SHA256 match against embedded h_Frozen constant.
+// Produces exactly 1 Frozen output with amount / owner / new_depth + every
+// tail field preserved byte-exact from the source Normal UTXO. Unlocking
+// pushes `frozen_body_bytes` (~1282b); locking verifies SHA256 match
+// against the embedded `h_Frozen` constant before splicing the pushed
+// bytes into the candidate Frozen output's script.
 //
-// h_Frozen is a 32-byte constant embedded in Normal body. Here it is a
-// placeholder of 32 zero bytes — SDK deployer patches in the real
-// SHA256(Frozen body) post-compilation. See H_FROZEN_PLACEHOLDER_HEX.
+// Rewrite scope (D.3.2):
+//   - Adapted to D.1 main-stack zone contract (was legacy A.2 altstack-
+//     centric). Same posture as D.3.1 PATH4: PKH-only auth, loose-bytes
+//     posture, no shared output-bytes helper.
+//   - Bug fix vs Phase 1A version: action_data byte for the candidate
+//     Frozen variable-prefix is `0x52` (= OP_2 opcode) per spec §3 template
+//     catalog (Frozen template `action_data = OP_2`). The legacy ASM
+//     wrote `026D` (data byte 0x02 + OP_2DROP byte 0x6d) which would have
+//     made the deployed Frozen UTXO unspendable — `0x02` in script is the
+//     "push 2 bytes" opcode, consuming subsequent bytes as data. The fix
+//     emits `526D` (= OP_2 opcode + OP_2DROP).
+//   - h_Frozen is computed at module load from the ACTUAL FROZEN_BODY_BYTES
+//     produced by `frozen-body.ts`. Pre-D.3.2 this was a 32-byte zero
+//     placeholder slated for SDK-deployer patching; with the D.3 series
+//     building toward end-to-end execution, embedding the real value is
+//     necessary for path-3 testing AND simplifies the deployment story
+//     (no out-of-band patching). FROZEN_BODY_BYTES itself is still on the
+//     legacy A.2 zone (frozen-body.ts hasn't been migrated yet) — the
+//     embedded hash will need refreshing once D.5 / Phase 1B closeout
+//     migrates Frozen to D.1 zone, but the BYTE-WIDTH of the hash (32b)
+//     is invariant so the Normal body's compile-time fixed-point holds.
 //
-// The Frozen candidate output script uses action_data = OP_2 (0x52) per §3
-// template catalog (Normal uses OP_0 / 0x00). Push bytes = `14 ‖ owner_pkh`
-// for PKH owner; `4c XX ‖ mpkh_preimage` for MPKH owner (owner preserved, so
-// same encoding as source's variable prefix owner).
+// Pre-state (PATH3_FREEZE_ASM entry):
+//   d0:  path_id (=3)
+//   d1:  hashPrev
+//   d2:  thisOut
+//   d3:  hashOutputs
+//   d4:  owner_pkh        (preserved across freeze)
+//   d5:  body
+//   d6:  optionalData
+//   d7:  depth (zone)     "my_depth" — preserved
+//   d8:  confiscAuth
+//   d9:  freezeAuth
+//   d10: authFlags
+//   d11: amount (zone)    "my_amount" — preserved
+//   d12: issuerPkh
+//   d13: tokenId
+//   d14: pubkey (freezeAuth's; consumed by `authIdentityCheckPkhAsm(9)`)
+//   d15: sig (freezeAuth's; consumed by `authIdentityCheckPkhAsm(9)`)
+//   d16: funding_outpoint (may be empty)
+//   d17: nullData (may be empty per spec §9.4)
+//   d18: output_tuple (40b: amount16 ‖ owner20 ‖ depth2 ‖ marker2=FEFF)
+//   d19: frozen_body_bytes (~1282b)
+//
+// Verification rules (per spec §9.4):
+//   1. authFlags bit 0 set (freezable enabled): `authFlags & 0x01 == 0x01`
+//   2. freezeAuth signature valid (PKH-only for now): HASH160(pubkey) ==
+//      zone.freezeAuth + CHECKSIGVERIFY (`authIdentityCheckPkhAsm(9)`)
+//   3. SHA256(pushed_frozen_body_bytes) == embedded h_Frozen
+//   4. Output[0]:
+//      - amount = zone.amount (preserved)
+//      - owner_pkh = zone.owner_pkh (preserved — freeze does NOT change
+//        ownership)
+//      - new_depth = zone.depth (preserved per spec rule 6)
+//      - marker = 0xFEFF (Frozen output marker)
+//   5. HASH256(reconstructed_output_bytes) == zone.hashOutputs
+//
+// Reconstructed candidate Frozen output script:
+//   0x14 ‖ owner_pkh ‖ 0x52 0x6D ‖ pushed_frozen_body ‖ 0x6A ‖ tail
+// Tail = same 8 fields as Normal tail (preserved from zone): tokenId,
+// issuerPkh, amount, authFlags, freezeAuth, confiscAuth, depth, optionalData.
+//
+// Sats hardcoded to 1 satoshi (BNTP v2 dust convention).
 
-// Placeholder SHA256 value for the Frozen template body. A 32-byte zero
-// push inserted directly into ASM. The SDK's deployer resolves the real
-// SHA256(Frozen body) at deploy time and patches these 32 bytes in-place
-// in the compiled locking script. Keeps byte count honest at compile time.
-export const H_FROZEN_PLACEHOLDER_HEX =
-  "0000000000000000000000000000000000000000000000000000000000000000";
+// h_Frozen = SHA256 of the actual Frozen template body bytes. Computed at
+// module load. Embedded as a 32-byte literal in PATH3_FREEZE_ASM.
+const H_FROZEN_HEX = toHex(sha256(FROZEN_BODY_BYTES));
+
+// Back-compat: the placeholder constant remains exported (former SDK-
+// deployer hook). Now equals the real h_Frozen hex; the "placeholder"
+// naming is retained to avoid breaking imports until the next API revision.
+export const H_FROZEN_PLACEHOLDER_HEX = H_FROZEN_HEX;
 
 export const PATH3_FREEZE_ASM = `
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK
-  01 OP_AND 01 OP_EQUALVERIFY
+  OP_10 OP_PICK
+  01 OP_AND
+  01 OP_EQUALVERIFY
 
-  ${authorityIdentityAsm("04")}
+  ${authIdentityCheckPkhAsm(9)}
 
-  OP_DEPTH OP_2 OP_SUB OP_PICK
+  11 OP_PICK
   OP_SHA256
-  ${H_FROZEN_PLACEHOLDER_HEX} OP_EQUALVERIFY
+  ${H_FROZEN_HEX} OP_EQUALVERIFY
 
-  OP_DEPTH OP_3 OP_SUB OP_PICK
-  10 OP_SPLIT
-  OP_OVER OP_BIN2NUM OP_0 OP_GREATERTHAN OP_VERIFY
-  OP_SWAP OP_TOALTSTACK
-  14 OP_SPLIT OP_SWAP OP_TOALTSTACK
-  OP_2 OP_SPLIT OP_SWAP OP_TOALTSTACK
+  OP_16 OP_ROLL
+  OP_16 OP_SPLIT
+  OP_SWAP
+
+  OP_13 OP_PICK
+  OP_EQUALVERIFY
+
+  14 OP_SPLIT
+  OP_SWAP
+
+  OP_6 OP_PICK
+  OP_EQUALVERIFY
+
+  OP_2 OP_SPLIT
   FEFF OP_EQUALVERIFY
-  OP_FROMALTSTACK
-  14 OP_CAT
-  026D OP_CAT
-  OP_DEPTH OP_2 OP_SUB OP_PICK OP_CAT
-  6A OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_CAT
-  OP_FROMALTSTACK OP_DUP OP_TOALTSTACK OP_CAT
-  ${VARINT_SERIALIZE_ASM}
+
+  OP_8 OP_PICK
+  OP_EQUALVERIFY
+
+  OP_13 OP_PICK
+  OP_13 OP_PICK
+  OP_CAT
+  OP_12 OP_PICK OP_CAT
+  OP_11 OP_PICK OP_CAT
+  OP_10 OP_PICK OP_CAT
+  OP_9 OP_PICK OP_CAT
+  OP_8 OP_PICK OP_CAT
+  OP_7 OP_PICK OP_CAT
+
+  6A OP_SWAP OP_CAT
+  11 OP_PICK OP_SWAP OP_CAT
+  526D OP_SWAP OP_CAT
+  OP_5 OP_PICK OP_SWAP OP_CAT
+  14 OP_SWAP OP_CAT
+
+  OP_DUP OP_SIZE OP_NIP
+  OP_2 OP_NUM2BIN
+  FD OP_SWAP OP_CAT
+  OP_SWAP OP_CAT
+  0100000000000000 OP_SWAP OP_CAT
 
   OP_HASH256
-  OP_FROMALTSTACK OP_EQUALVERIFY
+  OP_4 OP_PICK OP_EQUALVERIFY
 `;
 
 // ---------------------------------------------------------------------------

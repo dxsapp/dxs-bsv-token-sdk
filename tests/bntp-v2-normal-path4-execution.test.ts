@@ -217,52 +217,33 @@ const assembleConfiscateScenario = (s: ConfiscateScenario) => {
   };
 };
 
-// confiscAuthKey priv key chosen so HASH160(pubkey) yields bytes whose
-// in-place parsing (during the COVENANT's CHECKSIGVERIFY → stripCodeSeparators
-// scan over the FULL locking script, including the post-OP_RETURN tail)
-// does not trigger "Push out of bounds". The strict evaluator parses every
-// byte of the locking script as opcodes when computing scriptCode for the
-// SIGHASH preimage; tail bytes containing push opcodes (0x01-0x4b /
-// 0x4c-0x4e) demanding more bytes than available — which is common for a
-// random hash160 — would error out before the actual sig check.
-//
-// Path 1 tests sidestep this because their tail's confiscAuthHash and
-// freezeAuthHash are all-zero (zone fields the path doesn't exercise),
-// so the entire post-OP_RETURN region is benign 0x00 bytes (= OP_0). For
-// path 4 the confiscAuthHash MUST hash a real pubkey for the auth check
-// to mean anything; we brute-force-search a priv key whose resulting
-// hash160 has only safe bytes given a depth=1 trailer (`01 00`).
-//
-// Hash for the chosen key (priv = ...000000c1, decimal 193):
-//   96 c3 77 09 9c c3 fd c0 63 bb 7b bb 84 dc 7a 60 71 e7 c3 ac
-// Each byte is either ≥ 0x4f (non-push opcode), 0x00, or a small push that
-// fits within remaining tail bytes.
-//
-// LIMITATION: this restricts depth ∈ {0, 1} (depth=2..0x4b would push more
-// bytes than the script's 1 trailing byte allows). General-purpose
-// confiscate testing for arbitrary depth requires either:
-//   (a) protocol-level OP_CODESEPARATOR insertion before the COVENANT's
-//       CHECKSIGVERIFY (changes scriptCode contract — requires SDK update);
-//   (b) optionalData padding (lengthens the script suffix), or
-//   (c) more elaborate brute-force key + tail combinations.
-// All three are out of scope for D.3.1 (path-4-only proof).
-const SAFE_CONFISC_AUTH_PRIV_HEX =
-  "00000000000000000000000000000000000000000000000000000000000000c1";
-
+// confiscAuthKey is an arbitrary 32-byte priv (any value works post the
+// sighash scriptCode lenient-walker fix — see
+// `tests/sighash-scriptcode-lenient.test.ts`). Pre-fix this test had to
+// brute-force a key whose HASH160 produced only "safe" bytes (no push
+// opcodes demanding more bytes than the script's tail held), and depth
+// was capped at {0, 1}. The fix in `stripCodeSeparators` (lenient
+// byte-walker for sighash scriptCode construction) removed that
+// restriction by matching real BSV's tolerant FindAndDelete-equivalent
+// behaviour.
 const buildBaseScenario = (): ConfiscateScenario => ({
   ownerKey: new PrivateKey(
     hexBytes(
       "0000000000000000000000000000000000000000000000000000000000000042",
     ),
   ),
-  confiscAuthKey: new PrivateKey(hexBytes(SAFE_CONFISC_AUTH_PRIV_HEX)),
+  confiscAuthKey: new PrivateKey(
+    hexBytes(
+      "0000000000000000000000000000000000000000000000000000000000000099",
+    ),
+  ),
   newOwnerPkh: new Uint8Array(20).fill(0xaa),
   amount: BigInt(100),
   tokenId: new Uint8Array(32),
   issuerPkh: new Uint8Array(20).fill(0x11),
   authorityFlags: 0x02, // bit 1 = confiscatable enabled, no MPKH bits
   freezeAuthHash: new Uint8Array(20),
-  attestationDepth: 1, // non-zero to verify "preserved"; max safe = 1 (see comment above)
+  attestationDepth: 5, // arbitrary non-zero — exercises depth-preservation
   optionalData: new Uint8Array(),
   inputTxIdBE:
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -451,7 +432,11 @@ describe("BNTP v2 Normal — Path 4 confiscate (Wave D.3.1 execution)", () => {
       newDepth: scenario.attestationDepth,
       bodyMarker: new Uint8Array([0x01, 0xff]),
     };
-    const r = evalAdversarial(scenario.confiscAuthKey, tuple, scenario.authorityFlags);
+    const r = evalAdversarial(
+      scenario.confiscAuthKey,
+      tuple,
+      scenario.authorityFlags,
+    );
     expect(r.success).toBe(false);
     expect(r.error).toBeDefined();
   });
@@ -464,7 +449,11 @@ describe("BNTP v2 Normal — Path 4 confiscate (Wave D.3.1 execution)", () => {
       newDepth: 0, // canonical preserved value = 1
       bodyMarker: new Uint8Array([0x01, 0xff]),
     };
-    const r = evalAdversarial(scenario.confiscAuthKey, tuple, scenario.authorityFlags);
+    const r = evalAdversarial(
+      scenario.confiscAuthKey,
+      tuple,
+      scenario.authorityFlags,
+    );
     expect(r.success).toBe(false);
     expect(r.error).toBeDefined();
   });
@@ -477,7 +466,11 @@ describe("BNTP v2 Normal — Path 4 confiscate (Wave D.3.1 execution)", () => {
       newDepth: scenario.attestationDepth,
       bodyMarker: new Uint8Array([0x02, 0xff]), // not Normal marker
     };
-    const r = evalAdversarial(scenario.confiscAuthKey, tuple, scenario.authorityFlags);
+    const r = evalAdversarial(
+      scenario.confiscAuthKey,
+      tuple,
+      scenario.authorityFlags,
+    );
     expect(r.success).toBe(false);
     expect(r.error).toBeDefined();
   });

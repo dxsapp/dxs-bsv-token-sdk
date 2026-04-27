@@ -203,18 +203,88 @@ const decodePushData = (script: Bytes, offset: number) => {
   return { opcode, data: undefined, next: offset + 1 };
 };
 
+// Per BIP143 (BSV post-Genesis), the SIGHASH preimage's scriptCode is a
+// byte-level transform of the executing script's tail (post-codeSeparator):
+// copy bytes verbatim, removing only `OP_CODESEPARATOR` opcode bytes
+// (0xab). To distinguish 0xab opcodes from raw 0xab data inside a push,
+// the walker is push-aware.
+//
+// IMPORTANT — this walker is LENIENT about malformed pushes (push opcodes
+// demanding more bytes than the script holds). The strict
+// `decodePushData` used by the main interpreter loop throws on truncated
+// pushes — that's correct behaviour for execution (a script that doesn't
+// parse is invalid per consensus). But the sighash scriptCode path runs
+// on the full executing script, including any post-`OP_RETURN` data
+// section, where the bytes may resemble malformed push opcodes purely by
+// chance (e.g. a random 20-byte hash160 in a template's tail). Those
+// bytes never reach the main interpreter (OP_RETURN halts it) and don't
+// need to "parse cleanly" — they only need to hash deterministically.
+// Real BSV nodes tolerate truncated pushes here by folding the remainder
+// of the script into the output as-is; this implementation matches that
+// behaviour. See `tests/sighash-script-code-edge.test.ts` for the
+// scriptCode-byte-equivalence contract.
 const stripCodeSeparators = (script: Bytes): Bytes => {
   const parts: Bytes[] = [];
   let i = 0;
 
   while (i < script.length) {
-    const { opcode, data, next } = decodePushData(script, i);
-    if (data !== undefined) {
-      parts.push(script.subarray(i, next));
-    } else if (opcode !== OpCode.OP_CODESEPARATOR) {
-      parts.push(script.subarray(i, next));
+    const opcode = script[i];
+    let pushDataStart = i + 1;
+    let pushSize = 0;
+    let isPushOpcode = false;
+
+    if (opcode >= 1 && opcode <= 75) {
+      pushSize = opcode;
+      isPushOpcode = true;
+    } else if (opcode === OpCode.OP_PUSHDATA1) {
+      if (i + 1 < script.length) {
+        pushSize = script[i + 1];
+        pushDataStart = i + 2;
+        isPushOpcode = true;
+      } else {
+        // Truncated PUSHDATA1: no length byte present. Copy remaining
+        // bytes verbatim (lenient — the bytes are part of scriptCode for
+        // hashing) and stop.
+        parts.push(script.subarray(i));
+        break;
+      }
+    } else if (opcode === OpCode.OP_PUSHDATA2) {
+      if (i + 2 < script.length) {
+        pushSize = script[i + 1] | (script[i + 2] << 8);
+        pushDataStart = i + 3;
+        isPushOpcode = true;
+      } else {
+        parts.push(script.subarray(i));
+        break;
+      }
+    } else if (opcode === OpCode.OP_PUSHDATA4) {
+      if (i + 4 < script.length) {
+        pushSize =
+          (script[i + 1] |
+            (script[i + 2] << 8) |
+            (script[i + 3] << 16) |
+            (script[i + 4] << 24)) >>>
+          0;
+        pushDataStart = i + 5;
+        isPushOpcode = true;
+      } else {
+        parts.push(script.subarray(i));
+        break;
+      }
     }
-    i = next;
+
+    if (isPushOpcode) {
+      // Clamp the declared push end to the script length — a push that
+      // demands more bytes than available is folded as-is into scriptCode.
+      const end = Math.min(pushDataStart + pushSize, script.length);
+      parts.push(script.subarray(i, end));
+      i = end;
+    } else {
+      if (opcode !== OpCode.OP_CODESEPARATOR) {
+        parts.push(script.subarray(i, i + 1));
+      }
+      i += 1;
+    }
   }
 
   return concat(parts);

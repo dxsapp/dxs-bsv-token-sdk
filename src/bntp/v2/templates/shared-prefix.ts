@@ -365,6 +365,125 @@ export const prefixOwnerAndZoneAsm = (bodySize: number): string => {
   `;
 };
 
+// ===========================================================================
+// §3.5 + §3.6 + §3.7 — PREFIX Phases 5 + 6 + 7 (D.3 prep — owner-sig
+// extracted out of PREFIX into per-path SUFFIX).
+// ===========================================================================
+//
+// Background (D.3 prep refactor):
+//   The original `prefixOwnerAndZoneAsm` (D.1) baked owner-identity check
+//   (HASH160(pubkey)==owner_pkh + CHECKSIGVERIFY) into PREFIX itself. That
+//   was correct for path 1 (flex-transfer, owner-authorized) but wrong for
+//   paths 3/4 where authority — not owner — is the signer per spec
+//   §4.2 rule 4 / §9.4 / §9.5 (confiscate without owner consent is the
+//   whole point of confiscation; freeze likewise).
+//
+//   `prefixZoneAsm` is the path-agnostic PREFIX: walks the owner-prefix
+//   to extract owner_pkh into the §2 zone, but does NOT perform any sig
+//   check. Paths 1 and 2 (owner-authorized) prepend `OWNER_IDENTITY_CHECK_ASM`
+//   in their SUFFIX. Paths 3 and 4 (authority-authorized) call the more
+//   general `authorityIdentityAsm(flagMask)` helper instead.
+//
+// -- Postcondition (delta from `prefixOwnerAndZoneAsm`) ----------------------
+//
+//   `prefixOwnerAndZoneAsm`:
+//     main top-down = [path_id, zone(13), ...unlocking_rest]   (pubkey/sig consumed)
+//
+//   `prefixZoneAsm`:
+//     main top-down = [path_id, zone(13), pubkey, sig, ...unlocking_rest]
+//
+//   The two extra items (pubkey, sig) sit at depths 14 and 15 — between
+//   the zone and the witness — and are consumed by the path-specific
+//   identity check at SUFFIX entry.
+//
+// -- Byte budget --------------------------------------------------------------
+//
+//   `prefixZoneAsm`: ~48b (8b smaller than `prefixOwnerAndZoneAsm` thanks
+//   to the removed sig-check choreography). Net body change after
+//   `OWNER_IDENTITY_CHECK_ASM` (10b) is added to PATH1_ASM: +2b.
+export const prefixZoneAsm = (bodySize: number): string => {
+  const lo = bodySize & 0xff;
+  const hi = (bodySize >> 8) & 0xff;
+  const bodyLenHex = (
+    lo.toString(16).padStart(2, "0") + hi.toString(16).padStart(2, "0")
+  ).toLowerCase();
+  return `
+    OP_FROMALTSTACK
+    OP_1 OP_SPLIT OP_SWAP
+    14 OP_EQUALVERIFY
+    14 OP_SPLIT OP_SWAP
+    OP_TOALTSTACK
+    OP_2 OP_SPLIT OP_SWAP
+    006D OP_EQUALVERIFY
+
+    ${bodyLenHex} OP_BIN2NUM OP_SPLIT
+    OP_SWAP OP_TOALTSTACK
+    OP_1 OP_SPLIT OP_SWAP
+    6A OP_EQUALVERIFY
+
+    20 OP_SPLIT
+    14 OP_SPLIT
+    OP_16 OP_SPLIT
+    OP_1 OP_SPLIT
+    14 OP_SPLIT
+    14 OP_SPLIT
+    OP_2 OP_SPLIT
+
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+    OP_FROMALTSTACK
+
+    OP_15 OP_ROLL
+  `;
+};
+
+// Owner-identity check (PKH-only) for path 1 (flex-transfer) and path 2
+// (refresh) SUFFIX entry. Consumes pubkey and sig from depths 14/15
+// (inserted by `prefixZoneAsm`), restoring the legacy `prefixOwnerAndZoneAsm`
+// post-state where path_id sits at d0 and witness at d14+.
+//
+// Pre-state (post-`prefixZoneAsm`):
+//   main top-down = [path_id, hashPrev, thisOut, hashOut, owner_pkh,
+//                    body, optData, depth, confiscAuth, freezeAuth,
+//                    authFlags, amount, issuerPkh, tokenId,
+//                    pubkey, sig, ...witness, M]
+//
+// Post-state:
+//   main top-down = [path_id, hashPrev, thisOut, hashOut, owner_pkh,
+//                    body, optData, depth, confiscAuth, freezeAuth,
+//                    authFlags, amount, issuerPkh, tokenId,
+//                    ...witness, M]
+//
+// Sequence:
+//   OP_14 OP_ROLL          : pubkey (d14) → top; items 0..13 shift +1
+//   OP_DUP OP_HASH160       : compute hash160(pubkey); leaves [hash, pubkey,
+//                             path_id, hashPrev, ..., owner_pkh(d6), ...]
+//   OP_6 OP_PICK            : copy zone.owner_pkh (at d6) to top
+//   OP_EQUALVERIFY          : verify hash == owner_pkh; restores [pubkey, ...
+//                             path_id, ..., owner_pkh(d4), ..., sig(d15), ...]
+//   OP_15 OP_ROLL           : sig (d15) → top
+//   OP_SWAP                 : `OP_CHECKSIGVERIFY` pops pubKey first then
+//                             sigWithType; need pubkey on top, sig below.
+//                             Without SWAP the eval throws
+//                             "OP_CHECKSIGVERIFY missing FORKID" because the
+//                             sig bytes get parsed as a pubkey and the pubkey
+//                             bytes' last byte (lacking the 0x40 FORKID bit)
+//                             gets parsed as the sighashType.
+//   OP_CHECKSIGVERIFY       : verify sig over preimage authorization
+//
+// Byte budget: 11b. Replaces ~9b of inline sig-check from old PREFIX —
+// net +2-3b per body, in exchange for path-conditional auth dispatch.
+export const OWNER_IDENTITY_CHECK_ASM = `
+  OP_14 OP_ROLL
+  OP_DUP OP_HASH160
+  OP_6 OP_PICK OP_EQUALVERIFY
+  OP_15 OP_ROLL
+  OP_SWAP
+  OP_CHECKSIGVERIFY
+`;
+
 // Output serialization helper — FD-only varint (candidate scripts always
 // land in [0xFD..0xFFFF] range per decision #38; single-branch saves ~120b
 // vs 3-branch generic varint per A.2.5 retro-opt).

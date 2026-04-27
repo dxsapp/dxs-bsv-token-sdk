@@ -5,7 +5,8 @@ import {
   COVENANT_TAIL_ASM,
   SIGHASH_CHECK_ASM,
   PREIMAGE_PARSE_ASM,
-  prefixOwnerAndZoneAsm,
+  prefixZoneAsm,
+  OWNER_IDENTITY_CHECK_ASM,
   tailCacheAsm,
   VARINT_SERIALIZE_ASM,
   authorityIdentityAsm,
@@ -519,7 +520,16 @@ const PATH1_D2C2_CLOSING = `
   OP_NUMEQUALVERIFY
 `;
 
+// PATH1 SUFFIX entry: owner-identity check (D.3 prep refactor — owner-sig
+// extracted from PREFIX into per-path SUFFIX). See `OWNER_IDENTITY_CHECK_ASM`
+// in shared-prefix.ts for the full pre/post-state contract.
+//
+// After this 10b helper consumes pubkey + sig (left at d14, d15 by
+// `prefixZoneAsm`), the stack layout matches the legacy
+// `prefixOwnerAndZoneAsm` post-state — D.2a/D.2b/D.2c sub-blocks below
+// reference unchanged depths.
 const PATH1_ASM = `
+  ${OWNER_IDENTITY_CHECK_ASM}
   ${PATH1_D2A_HASH_PREVOUTS_BIND}
   ${PATH1_D2A_N_DERIVE_AND_AMOUNTS_LEN}
   ${PATH1_D2A_SELFPOS_CHECK}
@@ -868,20 +878,23 @@ const DISPATCHER_ASM = `
 `;
 
 // ---------------------------------------------------------------------------
-// Assemble NORMAL_BODY_ASM (Wave D.1)
+// Assemble NORMAL_BODY_ASM (Wave D.1, refactored D.3-prep)
 // ---------------------------------------------------------------------------
-// `prefixOwnerAndZoneAsm(bodySize)` consumes scriptCode from altstack and
-// produces the canonical §2 main-stack zone. Its compiled byte count is
-// invariant in `bodySize` (fixed-width 2-byte LE push), enabling a 1-pass
-// fixed-point compile: measure body with placeholder 0, then re-emit with
-// the measured value.
+// `prefixZoneAsm(bodySize)` consumes scriptCode from altstack and produces
+// the canonical §2 main-stack zone. Owner-sig is NOT verified in PREFIX
+// (D.3 prep) — pubkey + sig stay at d14, d15, consumed by per-path SUFFIX
+// auth check (`OWNER_IDENTITY_CHECK_ASM` for paths 1/2 owner-authorized,
+// `authorityIdentityAsm(...)` for paths 3/4 authority-authorized).
+//
+// `prefixZoneAsm`'s compiled byte count is invariant in `bodySize`
+// (fixed-width 2-byte LE push), enabling a 1-pass fixed-point compile.
 const buildNormalBodyAsm = (bodySize: number): string => `
   ${COVENANT_PREIMAGE_ROLL_ASM}
   ${COVENANT_S_PREAMBLE_ASM}
   ${COVENANT_TAIL_ASM}
   ${SIGHASH_CHECK_ASM}
   ${PREIMAGE_PARSE_ASM}
-  ${prefixOwnerAndZoneAsm(bodySize)}
+  ${prefixZoneAsm(bodySize)}
   ${DISPATCHER_ASM}
 `;
 
@@ -910,12 +923,12 @@ export const NORMAL_BODY_BYTES: Uint8Array = compileNormalBody();
 export const NORMAL_BODY_SIZE: number = NORMAL_BODY_BYTES.length;
 
 // Invariant check: the measurement pass must match the final pass, since
-// `prefixOwnerAndZoneAsm`'s compiled size is invariant in the bodySize value.
+// `prefixZoneAsm`'s compiled size is invariant in the bodySize value.
 // A violation indicates the ASM builder broke the fixed-width push assumption
 // (e.g., a value above 0x7FFF encoding with different semantics).
 if (NORMAL_BODY_SIZE !== MEASUREMENT_BODY_BYTES) {
   throw new Error(
-    `BNTP v2 Normal body: prefixOwnerAndZoneAsm compile size changed with bodySize. ` +
+    `BNTP v2 Normal body: prefixZoneAsm compile size changed with bodySize. ` +
       `Measured=${MEASUREMENT_BODY_BYTES}, final=${NORMAL_BODY_SIZE}.`,
   );
 }
@@ -936,8 +949,7 @@ export const NORMAL_BODY_SECTION_SIZES = {
   covenantTail: asmToBytes(COVENANT_TAIL_ASM).length,
   sighashCheck: asmToBytes(SIGHASH_CHECK_ASM).length,
   preimageParse: asmToBytes(PREIMAGE_PARSE_ASM).length,
-  prefixOwnerAndZone: asmToBytes(prefixOwnerAndZoneAsm(NORMAL_BODY_SIZE))
-    .length,
+  prefixZone: asmToBytes(prefixZoneAsm(NORMAL_BODY_SIZE)).length,
   path1: asmToBytes(PATH1_ASM).length,
   path2Refresh: asmToBytes(PATH2_REFRESH_ASM).length,
   path3Freeze: asmToBytes(PATH3_FREEZE_ASM).length,

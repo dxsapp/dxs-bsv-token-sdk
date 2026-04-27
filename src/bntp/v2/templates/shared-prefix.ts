@@ -533,6 +533,34 @@ export const OWNER_IDENTITY_CHECK_ASM = `
   OP_CHECKSIGVERIFY
 `;
 
+// ----------------------------------------------------------------------------
+// Output serialization helpers
+// ----------------------------------------------------------------------------
+//
+// `OUTPUT_BYTES_WRAP_ASM` — minimal wrapper used by the post-D.1 paths
+// (path 1 D.2c.2, path 3 D.3.2, path 4 D.3.1). Pre-state: a single
+// candidate-script byte string on top of stack. Post-state: that script
+// wrapped with the standard BSV output prefix (sats(8) ‖ FD-varint(3) ‖
+// candidate). 22b. Caller is responsible for any further composition
+// (e.g. CAT into a multi-output accumulator, HASH256 for the
+// hashOutputs commitment).
+//
+// `VARINT_SERIALIZE_ASM` — legacy multi-output composer (used by the
+// pre-D.1 path 2/3/4 ASM that's still inlined for byte-budget purposes
+// pending D.3.3). Pre-state: candidate-script on top, accumulator below.
+// Post-state: `accumulator ‖ sats ‖ varint ‖ candidate` on top. 23b
+// (one trailing OP_CAT vs `OUTPUT_BYTES_WRAP_ASM`). Phase 1A's audit-
+// fixed implementation; do not call from new code — prefer
+// `OUTPUT_BYTES_WRAP_ASM` + explicit CAT to make the composition
+// boundary visible.
+export const OUTPUT_BYTES_WRAP_ASM = `
+  OP_DUP OP_SIZE OP_NIP
+  OP_2 OP_NUM2BIN
+  FD OP_SWAP OP_CAT
+  OP_SWAP OP_CAT
+  0100000000000000 OP_SWAP OP_CAT
+`;
+
 // Output serialization helper — FD-only varint (candidate scripts always
 // land in [0xFD..0xFFFF] range per decision #38; single-branch saves ~120b
 // vs 3-branch generic varint per A.2.5 retro-opt).

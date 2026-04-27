@@ -100,8 +100,7 @@ describe("sighash scriptCode — lenient walker tolerates malformed pushes", () 
       tail,
     ]);
 
-    const inputTxIdBE =
-      "deadbeef" + "00".repeat(28); // arbitrary
+    const inputTxIdBE = "deadbeef" + "00".repeat(28); // arbitrary
     const outpoint = outpointBytes(inputTxIdBE, 0);
     const sequenceBytes = new Uint8Array([0xff, 0xff, 0xff, 0xff]);
     const hashPrevouts = hash256(outpoint);
@@ -144,31 +143,28 @@ describe("sighash scriptCode — lenient walker tolerates malformed pushes", () 
       0xffffffff,
     );
     const txOutput = new TransactionOutput(1, outputLockingScript);
-    const tx = new Transaction(
-      new Uint8Array(),
-      [txInput],
-      [txOutput],
-      1,
-      0,
+    const tx = new Transaction(new Uint8Array(), [txInput], [txOutput], 1, 0);
+
+    const prevOutputs: PrevOutput[] = [{ lockingScript, satoshis: 1 }];
+
+    const r = evaluateScripts(
+      unlockingScript,
+      lockingScript,
+      {
+        tx,
+        inputIndex: 0,
+        prevOutputs,
+      },
+      {
+        allowOpReturn: true,
+        scriptFlags: FLAGS,
+        strict: false,
+        maxScriptSizeBytes: 100_000,
+        maxOps: 10_000,
+        maxStackDepth: 1_000,
+        maxElementSizeBytes: 100_000,
+      },
     );
-
-    const prevOutputs: PrevOutput[] = [
-      { lockingScript, satoshis: 1 },
-    ];
-
-    const r = evaluateScripts(unlockingScript, lockingScript, {
-      tx,
-      inputIndex: 0,
-      prevOutputs,
-    }, {
-      allowOpReturn: true,
-      scriptFlags: FLAGS,
-      strict: false,
-      maxScriptSizeBytes: 100_000,
-      maxOps: 10_000,
-      maxStackDepth: 1_000,
-      maxElementSizeBytes: 100_000,
-    });
 
     expect(r.success).toBe(true);
     expect(r.error).toBeUndefined();
@@ -238,30 +234,27 @@ describe("sighash scriptCode — lenient walker tolerates malformed pushes", () 
       0xffffffff,
     );
     const txOutput = new TransactionOutput(1, outputLockingScript);
-    const tx = new Transaction(
-      new Uint8Array(),
-      [txInput],
-      [txOutput],
-      1,
-      0,
-    );
-    const prevOutputs: PrevOutput[] = [
-      { lockingScript, satoshis: 1 },
-    ];
+    const tx = new Transaction(new Uint8Array(), [txInput], [txOutput], 1, 0);
+    const prevOutputs: PrevOutput[] = [{ lockingScript, satoshis: 1 }];
 
-    const r = evaluateScripts(unlockingScript, lockingScript, {
-      tx,
-      inputIndex: 0,
-      prevOutputs,
-    }, {
-      allowOpReturn: true,
-      scriptFlags: FLAGS,
-      strict: false,
-      maxScriptSizeBytes: 100_000,
-      maxOps: 10_000,
-      maxStackDepth: 1_000,
-      maxElementSizeBytes: 100_000,
-    });
+    const r = evaluateScripts(
+      unlockingScript,
+      lockingScript,
+      {
+        tx,
+        inputIndex: 0,
+        prevOutputs,
+      },
+      {
+        allowOpReturn: true,
+        scriptFlags: FLAGS,
+        strict: false,
+        maxScriptSizeBytes: 100_000,
+        maxOps: 10_000,
+        maxStackDepth: 1_000,
+        maxElementSizeBytes: 100_000,
+      },
+    );
 
     expect(r.success).toBe(true);
     expect(r.error).toBeUndefined();
@@ -340,25 +333,22 @@ describe("sighash scriptCode — lenient walker tolerates malformed pushes", () 
       0xffffffff,
     );
     const txOutput = new TransactionOutput(1, outputLockingScript);
-    const tx = new Transaction(
-      new Uint8Array(),
-      [txInput],
-      [txOutput],
-      1,
-      0,
-    );
-    const prevOutputs: PrevOutput[] = [
-      { lockingScript, satoshis: 1 },
-    ];
+    const tx = new Transaction(new Uint8Array(), [txInput], [txOutput], 1, 0);
+    const prevOutputs: PrevOutput[] = [{ lockingScript, satoshis: 1 }];
 
-    const r = evaluateScripts(unlockingScript, lockingScript, {
-      tx,
-      inputIndex: 0,
-      prevOutputs,
-    }, {
-      scriptFlags: FLAGS,
-      strict: false,
-    });
+    const r = evaluateScripts(
+      unlockingScript,
+      lockingScript,
+      {
+        tx,
+        inputIndex: 0,
+        prevOutputs,
+      },
+      {
+        scriptFlags: FLAGS,
+        strict: false,
+      },
+    );
     expect(r.success).toBe(true);
     expect(r.error).toBeUndefined();
   });

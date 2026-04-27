@@ -71,28 +71,22 @@ describe("BNTP v2 Normal template — body size (A.1.1 + A.2 + A.2.5 + A.3)", ()
     expect(NORMAL_BODY_BYTES[4]).toBe(0x75);
   });
 
-  test("body size is within Phase 1B ABORT ceiling (≤ 4500b — TODO: tighten in optimization wave)", () => {
-    // Phase 1A ratified a 2700b ABORT ceiling. Phase 1B Wave D.2c.2 ships
-    // path-1 reconstruction + hashOutputs closure in a deliberately loose-
-    // bytes form (no shared helpers, no varint optimization, no zone-shuttle
-    // amortization across iters). The post-D.2c.2 body lands in the
-    // 2400-2900b band. Per the "working protocol first, optimization later"
-    // posture, the ceiling is raised temporarily.
-    //
-    // The optimization wave (post Phase 1B end-to-end execution proof) MUST
-    // re-tighten this back to ≤ 2700b. Tracker: see D.2c.2 commit message.
-    expect(NORMAL_BODY_SIZE).toBeLessThanOrEqual(4500);
+  test("body size is within ABORT ceiling (≤ 2700b)", () => {
+    // Phase 1A G5 gate: PASS ≤ 2600, PIVOT 2600-2700, ABORT > 2700.
+    // Phase 1B temporarily relaxed to 4500 during D.2c (working-bytes-first
+    // posture); restored here as part of the optimization wave now that
+    // paths 1/3/4 are implemented end-to-end and a shared
+    // OUTPUT_BYTES_WRAP_ASM helper has consolidated the per-path output
+    // serialization. Path 2 (D.3.3) currently inlined as legacy dead code
+    // — it'll be rewritten in the next wave; the body has ample headroom.
+    expect(NORMAL_BODY_SIZE).toBeLessThanOrEqual(2700);
   });
 
   test("G5 verdict helper — PASS / PIVOT / ABORT band classification", () => {
-    // Phase 1A bands (PASS ≤ 2600, PIVOT 2600-2700, ABORT > 2700) are
-    // relaxed for Phase 1B D.2c.2 (working-first, optimize-later posture).
-    // Bands here mirror the relaxed ceiling: PASS ≤ 4000, PIVOT 4000-4500,
-    // ABORT > 4500. Restoring Phase 1A bands is part of the optimization
-    // wave alongside the size-test re-tightening.
+    // Phase 1A G5 gate restored.
     let verdict: "PASS" | "PIVOT" | "ABORT";
-    if (NORMAL_BODY_SIZE <= 4000) verdict = "PASS";
-    else if (NORMAL_BODY_SIZE <= 4500) verdict = "PIVOT";
+    if (NORMAL_BODY_SIZE <= 2600) verdict = "PASS";
+    else if (NORMAL_BODY_SIZE <= 2700) verdict = "PIVOT";
     else verdict = "ABORT";
 
     expect(verdict).not.toBe("ABORT");
@@ -168,11 +162,10 @@ describe("BNTP v2 Normal template — body size (A.1.1 + A.2 + A.2.5 + A.3)", ()
   });
 
   test("G5 gate verdict", () => {
-    // Phase 1B relaxed bands (working-first posture): PASS ≤ 4000 | PIVOT
-    // 4000-4500 | ABORT > 4500. Phase 1A bands restored in optimization wave.
+    // Phase 1A G5 gate: PASS ≤ 2600 | PIVOT 2600-2700 | ABORT > 2700.
     let verdict: "PASS" | "PIVOT" | "ABORT";
-    if (NORMAL_BODY_SIZE <= 4000) verdict = "PASS";
-    else if (NORMAL_BODY_SIZE <= 4500) verdict = "PIVOT";
+    if (NORMAL_BODY_SIZE <= 2600) verdict = "PASS";
+    else if (NORMAL_BODY_SIZE <= 2700) verdict = "PIVOT";
     else verdict = "ABORT";
 
     console.log(`G5 verdict: ${verdict} (${NORMAL_BODY_SIZE} bytes)`);
